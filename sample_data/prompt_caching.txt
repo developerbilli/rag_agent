@@ -1,0 +1,6 @@
+Prompt Caching and Context Windows in Tiny LLMs
+
+Tiny language models typically have restricted context windows ranging between 2048 and 8192 tokens.
+Because memory bandwidth is the primary bottleneck during autoregressive token generation, feeding oversized contexts directly degrades generation throughput.
+RAG solves this by filtering large document corpuses down to only the top 3-5 most pertinent context paragraphs before generation.
+This ensures optimal inference speed while avoiding the dreaded 'lost in the middle' phenomenon where smaller models lose focus over lengthy prompts.

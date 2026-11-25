@@ -1,0 +1,402 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+             xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+             xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+             id="Definitions_RAG_Pipeline"
+             targetNamespace="http://bpmn.io/schema/bpmn"
+             exporter="Antigravity BPMN Engine"
+             exporterVersion="2.0">
+
+  <collaboration id="Collaboration_RAG">
+    <participant id="Participant_RAG_System" name="Production RAG &amp; Data Analysis Agent" processRef="Process_RAG_Execution" />
+  </collaboration>
+
+  <process id="Process_RAG_Execution" isExecutable="true">
+    <laneSet id="LaneSet_RAG">
+      <lane id="Lane_User" name="User">
+        <flowNodeRef>StartEvent_UserQuery</flowNodeRef>
+        <flowNodeRef>EndEvent_SuccessResponse</flowNodeRef>
+        <flowNodeRef>EndEvent_RefusalResponse</flowNodeRef>
+      </lane>
+
+      <lane id="Lane_Orchestrator" name="RAG Orchestrator / Agent">
+        <flowNodeRef>Task_ValidateQuery</flowNodeRef>
+        <flowNodeRef>Gateway_CheckMemory</flowNodeRef>
+        <flowNodeRef>Task_CondenseQuery</flowNodeRef>
+        <flowNodeRef>Task_DecomposeQuery</flowNodeRef>
+        <flowNodeRef>Task_AssemblePrompt</flowNodeRef>
+        <flowNodeRef>Task_RecordMemory</flowNodeRef>
+        <flowNodeRef>Task_HandleRetry</flowNodeRef>
+      </lane>
+
+      <lane id="Lane_Structured" name="Structured Data System (Recommended)">
+        <flowNodeRef>Task_QueryStructuredDB</flowNodeRef>
+      </lane>
+
+      <lane id="Lane_Retrieval" name="Document Retrieval System">
+        <flowNodeRef>Task_ParallelSearch</flowNodeRef>
+        <flowNodeRef>Task_RRFFusion</flowNodeRef>
+        <flowNodeRef>Task_RerankCandidates</flowNodeRef>
+      </lane>
+
+      <lane id="Lane_Guardrails" name="Evaluation &amp; Guardrail System">
+        <flowNodeRef>Gateway_ConfidenceCheck</flowNodeRef>
+        <flowNodeRef>Task_VerifyClaims</flowNodeRef>
+        <flowNodeRef>Gateway_ValidationCheck</flowNodeRef>
+        <flowNodeRef>Gateway_RetryCheck</flowNodeRef>
+      </lane>
+
+      <lane id="Lane_LLM" name="LLM Generator">
+        <flowNodeRef>Task_GenerateAnswer</flowNodeRef>
+      </lane>
+    </laneSet>
+
+    <!-- Start Event -->
+    <startEvent id="StartEvent_UserQuery" name="User Submits Query">
+      <outgoing>Flow_1</outgoing>
+    </startEvent>
+
+    <!-- Orchestrator Tasks -->
+    <serviceTask id="Task_ValidateQuery" name="Validate Query &amp; Session State">
+      <incoming>Flow_1</incoming>
+      <outgoing>Flow_2</outgoing>
+    </serviceTask>
+
+    <exclusiveGateway id="Gateway_CheckMemory" name="Multi-Turn History Present?">
+      <incoming>Flow_2</incoming>
+      <outgoing>Flow_MemoryYes</outgoing>
+      <outgoing>Flow_MemoryNo</outgoing>
+    </exclusiveGateway>
+
+    <serviceTask id="Task_CondenseQuery" name="Condense Query &amp; Resolve Coreferences (ConversationManager)">
+      <incoming>Flow_MemoryYes</incoming>
+      <outgoing>Flow_3</outgoing>
+    </serviceTask>
+
+    <serviceTask id="Task_DecomposeQuery" name="Decompose Query into Structured &amp; Semantic Intents">
+      <incoming>Flow_MemoryNo</incoming>
+      <incoming>Flow_3</incoming>
+      <outgoing>Flow_ToStructured</outgoing>
+      <outgoing>Flow_ToRetrieval</outgoing>
+    </serviceTask>
+
+    <!-- Structured Data System Task -->
+    <serviceTask id="Task_QueryStructuredDB" name="Execute SQL / Relational Query (Filters &amp; Aggregations)">
+      <incoming>Flow_ToStructured</incoming>
+      <outgoing>Flow_FromStructured</outgoing>
+    </serviceTask>
+
+    <!-- Document Retrieval System Tasks -->
+    <serviceTask id="Task_ParallelSearch" name="Parallel First-Stage Search (Dense Cosine + BM25 Okapi)">
+      <incoming>Flow_ToRetrieval</incoming>
+      <outgoing>Flow_ToRRF</outgoing>
+    </serviceTask>
+
+    <serviceTask id="Task_RRFFusion" name="Reciprocal Rank Fusion (k=60) (VectorIndexer.search_hybrid)">
+      <incoming>Flow_ToRRF</incoming>
+      <incoming>Flow_FromStructured</incoming>
+      <outgoing>Flow_ToRerank</outgoing>
+    </serviceTask>
+
+    <serviceTask id="Task_RerankCandidates" name="Two-Stage Candidate Reranking (CrossEncoderReRanker)">
+      <incoming>Flow_ToRerank</incoming>
+      <outgoing>Flow_ToConfidenceGate</outgoing>
+    </serviceTask>
+
+    <!-- Guardrail Confidence Gateway -->
+    <exclusiveGateway id="Gateway_ConfidenceCheck" name="Retrieval Confidence &gt;= Threshold?">
+      <incoming>Flow_ToConfidenceGate</incoming>
+      <outgoing>Flow_ConfidencePass</outgoing>
+      <outgoing>Flow_ConfidenceFail</outgoing>
+    </exclusiveGateway>
+
+    <!-- Orchestrator Prompt Assembly -->
+    <serviceTask id="Task_AssemblePrompt" name="Assemble Context-Bounded Prompt (PromptAssembler)">
+      <incoming>Flow_ConfidencePass</incoming>
+      <incoming>Flow_FromRetry</incoming>
+      <outgoing>Flow_ToLLM</outgoing>
+    </serviceTask>
+
+    <!-- LLM Generator -->
+    <serviceTask id="Task_GenerateAnswer" name="Generate Grounded Response (Ollama / Gemini / Offline)">
+      <incoming>Flow_ToLLM</incoming>
+      <outgoing>Flow_ToVerification</outgoing>
+    </serviceTask>
+
+    <!-- Claim Verification Task -->
+    <serviceTask id="Task_VerifyClaims" name="Propositional Claim &amp; Polarity Verification (SemanticClaimVerifier)">
+      <incoming>Flow_ToVerification</incoming>
+      <outgoing>Flow_ToValidationGate</outgoing>
+    </serviceTask>
+
+    <!-- Groundedness Validation Gateway -->
+    <exclusiveGateway id="Gateway_ValidationCheck" name="Answer Grounded &amp; Citations Valid?">
+      <incoming>Flow_ToValidationGate</incoming>
+      <outgoing>Flow_ValidationPass</outgoing>
+      <outgoing>Flow_ValidationFail</outgoing>
+    </exclusiveGateway>
+
+    <!-- Retry Decision Gateway -->
+    <exclusiveGateway id="Gateway_RetryCheck" name="Retry Attempts &lt; Max?">
+      <incoming>Flow_ValidationFail</incoming>
+      <outgoing>Flow_RetryYes</outgoing>
+      <outgoing>Flow_RetryNo</outgoing>
+    </exclusiveGateway>
+
+    <serviceTask id="Task_HandleRetry" name="Prepare Corrective Prompt Feedback">
+      <incoming>Flow_RetryYes</incoming>
+      <outgoing>Flow_FromRetry</outgoing>
+    </serviceTask>
+
+    <!-- Memory Update & End Events -->
+    <serviceTask id="Task_RecordMemory" name="Record Turn in Conversation Memory (ConversationManager)">
+      <incoming>Flow_ValidationPass</incoming>
+      <outgoing>Flow_SuccessEnd</outgoing>
+    </serviceTask>
+
+    <endEvent id="EndEvent_SuccessResponse" name="Deliver Factual Grounded Response">
+      <incoming>Flow_SuccessEnd</incoming>
+    </endEvent>
+
+    <endEvent id="EndEvent_RefusalResponse" name="Deliver Contextual Refusal / Limitation Notice">
+      <incoming>Flow_ConfidenceFail</incoming>
+      <incoming>Flow_RetryNo</incoming>
+    </endEvent>
+
+    <!-- Sequence Flows -->
+    <sequenceFlow id="Flow_1" sourceRef="StartEvent_UserQuery" targetRef="Task_ValidateQuery" />
+    <sequenceFlow id="Flow_2" sourceRef="Task_ValidateQuery" targetRef="Gateway_CheckMemory" />
+    <sequenceFlow id="Flow_MemoryYes" name="Yes" sourceRef="Gateway_CheckMemory" targetRef="Task_CondenseQuery" />
+    <sequenceFlow id="Flow_MemoryNo" name="No" sourceRef="Gateway_CheckMemory" targetRef="Task_DecomposeQuery" />
+    <sequenceFlow id="Flow_3" sourceRef="Task_CondenseQuery" targetRef="Task_DecomposeQuery" />
+
+    <sequenceFlow id="Flow_ToStructured" sourceRef="Task_DecomposeQuery" targetRef="Task_QueryStructuredDB" />
+    <sequenceFlow id="Flow_ToRetrieval" sourceRef="Task_DecomposeQuery" targetRef="Task_ParallelSearch" />
+
+    <sequenceFlow id="Flow_FromStructured" sourceRef="Task_QueryStructuredDB" targetRef="Task_RRFFusion" />
+    <sequenceFlow id="Flow_ToRRF" sourceRef="Task_ParallelSearch" targetRef="Task_RRFFusion" />
+    <sequenceFlow id="Flow_ToRerank" sourceRef="Task_RRFFusion" targetRef="Task_RerankCandidates" />
+    <sequenceFlow id="Flow_ToConfidenceGate" sourceRef="Task_RerankCandidates" targetRef="Gateway_ConfidenceCheck" />
+
+    <sequenceFlow id="Flow_ConfidencePass" name="Yes (Score &gt;= Threshold)" sourceRef="Gateway_ConfidenceCheck" targetRef="Task_AssemblePrompt" />
+    <sequenceFlow id="Flow_ConfidenceFail" name="No (Score &lt; Threshold)" sourceRef="Gateway_ConfidenceCheck" targetRef="EndEvent_RefusalResponse" />
+
+    <sequenceFlow id="Flow_ToLLM" sourceRef="Task_AssemblePrompt" targetRef="Task_GenerateAnswer" />
+    <sequenceFlow id="Flow_ToVerification" sourceRef="Task_GenerateAnswer" targetRef="Task_VerifyClaims" />
+    <sequenceFlow id="Flow_ToValidationGate" sourceRef="Task_VerifyClaims" targetRef="Gateway_ValidationCheck" />
+
+    <sequenceFlow id="Flow_ValidationPass" name="Passed" sourceRef="Gateway_ValidationCheck" targetRef="Task_RecordMemory" />
+    <sequenceFlow id="Flow_ValidationFail" name="Failed (Contradiction/Hallucination)" sourceRef="Gateway_ValidationCheck" targetRef="Gateway_RetryCheck" />
+
+    <sequenceFlow id="Flow_RetryYes" name="Yes" sourceRef="Gateway_RetryCheck" targetRef="Task_HandleRetry" />
+    <sequenceFlow id="Flow_RetryNo" name="No (Exhausted)" sourceRef="Gateway_RetryCheck" targetRef="EndEvent_RefusalResponse" />
+    <sequenceFlow id="Flow_FromRetry" sourceRef="Task_HandleRetry" targetRef="Task_AssemblePrompt" />
+
+    <sequenceFlow id="Flow_SuccessEnd" sourceRef="Task_RecordMemory" targetRef="EndEvent_SuccessResponse" />
+  </process>
+
+  <!-- Diagram Visual Layout Information (BPMN DI) -->
+  <bpmndi:BPMNDiagram id="BPMNDiagram_RAG">
+    <bpmndi:BPMNPlane id="BPMNPlane_RAG" bpmnElement="Collaboration_RAG">
+      <!-- Participant Pool -->
+      <bpmndi:BPMNShape id="Participant_Shape" bpmnElement="Participant_RAG_System" isHorizontal="true">
+        <dc:Bounds x="160" y="80" width="1450" height="980" />
+      </bpmndi:BPMNShape>
+
+      <!-- Lanes -->
+      <bpmndi:BPMNShape id="Lane_User_Shape" bpmnElement="Lane_User" isHorizontal="true">
+        <dc:Bounds x="190" y="80" width="1420" height="130" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_Orchestrator_Shape" bpmnElement="Lane_Orchestrator" isHorizontal="true">
+        <dc:Bounds x="190" y="210" width="1420" height="200" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_Structured_Shape" bpmnElement="Lane_Structured" isHorizontal="true">
+        <dc:Bounds x="190" y="410" width="1420" height="140" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_Retrieval_Shape" bpmnElement="Lane_Retrieval" isHorizontal="true">
+        <dc:Bounds x="190" y="550" width="1420" height="170" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_Guardrails_Shape" bpmnElement="Lane_Guardrails" isHorizontal="true">
+        <dc:Bounds x="190" y="720" width="1420" height="180" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_LLM_Shape" bpmnElement="Lane_LLM" isHorizontal="true">
+        <dc:Bounds x="190" y="900" width="1420" height="160" />
+      </bpmndi:BPMNShape>
+
+      <!-- Elements in User Lane -->
+      <bpmndi:BPMNShape id="Shape_StartEvent" bpmnElement="StartEvent_UserQuery">
+        <dc:Bounds x="240" y="122" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_EndSuccess" bpmnElement="EndEvent_SuccessResponse">
+        <dc:Bounds x="1510" y="122" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_EndRefusal" bpmnElement="EndEvent_RefusalResponse">
+        <dc:Bounds x="1080" y="122" width="36" height="36" />
+      </bpmndi:BPMNShape>
+
+      <!-- Elements in Orchestrator Lane -->
+      <bpmndi:BPMNShape id="Shape_ValidateQuery" bpmnElement="Task_ValidateQuery">
+        <dc:Bounds x="210" y="260" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_CheckMemory" bpmnElement="Gateway_CheckMemory" isMarkerVisible="true">
+        <dc:Bounds x="360" y="270" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_CondenseQuery" bpmnElement="Task_CondenseQuery">
+        <dc:Bounds x="440" y="230" width="130" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_DecomposeQuery" bpmnElement="Task_DecomposeQuery">
+        <dc:Bounds x="600" y="260" width="130" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_AssemblePrompt" bpmnElement="Task_AssemblePrompt">
+        <dc:Bounds x="1030" y="260" width="130" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_HandleRetry" bpmnElement="Task_HandleRetry">
+        <dc:Bounds x="1200" y="260" width="120" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_RecordMemory" bpmnElement="Task_RecordMemory">
+        <dc:Bounds x="1460" y="260" width="120" height="70" />
+      </bpmndi:BPMNShape>
+
+      <!-- Elements in Structured Lane -->
+      <bpmndi:BPMNShape id="Shape_QueryStructuredDB" bpmnElement="Task_QueryStructuredDB">
+        <dc:Bounds x="600" y="440" width="140" height="70" />
+      </bpmndi:BPMNShape>
+
+      <!-- Elements in Retrieval Lane -->
+      <bpmndi:BPMNShape id="Shape_ParallelSearch" bpmnElement="Task_ParallelSearch">
+        <dc:Bounds x="600" y="590" width="140" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_RRFFusion" bpmnElement="Task_RRFFusion">
+        <dc:Bounds x="780" y="590" width="130" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_RerankCandidates" bpmnElement="Task_RerankCandidates">
+        <dc:Bounds x="940" y="590" width="130" height="70" />
+      </bpmndi:BPMNShape>
+
+      <!-- Elements in Guardrails Lane -->
+      <bpmndi:BPMNShape id="Shape_ConfidenceCheck" bpmnElement="Gateway_ConfidenceCheck" isMarkerVisible="true">
+        <dc:Bounds x="980" y="780" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_VerifyClaims" bpmnElement="Task_VerifyClaims">
+        <dc:Bounds x="1190" y="770" width="130" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_ValidationCheck" bpmnElement="Gateway_ValidationCheck" isMarkerVisible="true">
+        <dc:Bounds x="1360" y="780" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_RetryCheck" bpmnElement="Gateway_RetryCheck" isMarkerVisible="true">
+        <dc:Bounds x="1360" y="850" width="50" height="50" />
+      </bpmndi:BPMNShape>
+
+      <!-- Elements in LLM Lane -->
+      <bpmndi:BPMNShape id="Shape_GenerateAnswer" bpmnElement="Task_GenerateAnswer">
+        <dc:Bounds x="1030" y="940" width="140" height="70" />
+      </bpmndi:BPMNShape>
+
+      <!-- Sequence Flow Edges -->
+      <bpmndi:BPMNEdge id="Edge_Flow1" bpmnElement="Flow_1">
+        <di:waypoint x="258" y="158" />
+        <di:waypoint x="258" y="260" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_Flow2" bpmnElement="Flow_2">
+        <di:waypoint x="320" y="295" />
+        <di:waypoint x="360" y="295" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_MemoryYes" bpmnElement="Flow_MemoryYes">
+        <di:waypoint x="385" y="270" />
+        <di:waypoint x="385" y="265" />
+        <di:waypoint x="440" y="265" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_MemoryNo" bpmnElement="Flow_MemoryNo">
+        <di:waypoint x="385" y="320" />
+        <di:waypoint x="385" y="350" />
+        <di:waypoint x="665" y="350" />
+        <di:waypoint x="665" y="330" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_Flow3" bpmnElement="Flow_3">
+        <di:waypoint x="570" y="265" />
+        <di:waypoint x="600" y="265" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_ToStructured" bpmnElement="Flow_ToStructured">
+        <di:waypoint x="665" y="330" />
+        <di:waypoint x="665" y="440" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_ToRetrieval" bpmnElement="Flow_ToRetrieval">
+        <di:waypoint x="690" y="330" />
+        <di:waypoint x="690" y="590" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_FromStructured" bpmnElement="Flow_FromStructured">
+        <di:waypoint x="740" y="475" />
+        <di:waypoint x="845" y="475" />
+        <di:waypoint x="845" y="590" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_ToRRF" bpmnElement="Flow_ToRRF">
+        <di:waypoint x="740" y="625" />
+        <di:waypoint x="780" y="625" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_ToRerank" bpmnElement="Flow_ToRerank">
+        <di:waypoint x="910" y="625" />
+        <di:waypoint x="940" y="625" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_ToConfidenceGate" bpmnElement="Flow_ToConfidenceGate">
+        <di:waypoint x="1005" y="660" />
+        <di:waypoint x="1005" y="780" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_ConfidencePass" bpmnElement="Flow_ConfidencePass">
+        <di:waypoint x="1030" y="805" />
+        <di:waypoint x="1095" y="805" />
+        <di:waypoint x="1095" y="330" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_ConfidenceFail" bpmnElement="Flow_ConfidenceFail">
+        <di:waypoint x="1005" y="830" />
+        <di:waypoint x="1005" y="860" />
+        <di:waypoint x="1098" y="860" />
+        <di:waypoint x="1098" y="158" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_ToLLM" bpmnElement="Flow_ToLLM">
+        <di:waypoint x="1095" y="330" />
+        <di:waypoint x="1095" y="940" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_ToVerification" bpmnElement="Flow_ToVerification">
+        <di:waypoint x="1170" y="975" />
+        <di:waypoint x="1255" y="975" />
+        <di:waypoint x="1255" y="840" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_ToValidationGate" bpmnElement="Flow_ToValidationGate">
+        <di:waypoint x="1320" y="805" />
+        <di:waypoint x="1360" y="805" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_ValidationPass" bpmnElement="Flow_ValidationPass">
+        <di:waypoint x="1410" y="805" />
+        <di:waypoint x="1520" y="805" />
+        <di:waypoint x="1520" y="330" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_ValidationFail" bpmnElement="Flow_ValidationFail">
+        <di:waypoint x="1385" y="830" />
+        <di:waypoint x="1385" y="850" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_RetryYes" bpmnElement="Flow_RetryYes">
+        <di:waypoint x="1360" y="875" />
+        <di:waypoint x="1260" y="875" />
+        <di:waypoint x="1260" y="330" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_RetryNo" bpmnElement="Flow_RetryNo">
+        <di:waypoint x="1385" y="900" />
+        <di:waypoint x="1385" y="920" />
+        <di:waypoint x="1115" y="920" />
+        <di:waypoint x="1115" y="158" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_FromRetry" bpmnElement="Flow_FromRetry">
+        <di:waypoint x="1200" y="295" />
+        <di:waypoint x="1160" y="295" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_SuccessEnd" bpmnElement="Flow_SuccessEnd">
+        <di:waypoint x="1528" y="260" />
+        <di:waypoint x="1528" y="158" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+
+</definitions>
+

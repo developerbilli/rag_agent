@@ -1,0 +1,83 @@
+{
+  "scale": {
+    "10000": {
+      "count": 10000,
+      "ram_mb": 98.21,
+      "peak_ram_mb": 98.53,
+      "bm25_index_time_s": 0.255,
+      "dense_p50_ms": 0.3,
+      "dense_p95_ms": 0.37,
+      "dense_p99_ms": 0.41,
+      "bm25_p50_ms": 8.12,
+      "bm25_p95_ms": 15.82,
+      "bm25_p99_ms": 19.51,
+      "hybrid_p50_ms": 9.22,
+      "hybrid_p95_ms": 16.43,
+      "hybrid_p99_ms": 20.84,
+      "save_time_ms": 852.94,
+      "snap_size_mb": 16.51,
+      "load_time_ms": 278.19,
+      "recovery_success": true
+    },
+    "50000": {
+      "count": 50000,
+      "ram_mb": 195.1,
+      "peak_ram_mb": 219.73,
+      "bm25_index_time_s": 1.302,
+      "dense_p50_ms": 2.14,
+      "dense_p95_ms": 2.55,
+      "dense_p99_ms": 2.69,
+      "bm25_p50_ms": 61.1,
+      "bm25_p95_ms": 93.62,
+      "bm25_p99_ms": 154.6,
+      "hybrid_p50_ms": 63.48,
+      "hybrid_p95_ms": 96.81,
+      "hybrid_p99_ms": 101.08,
+      "save_time_ms": 4324.72,
+      "snap_size_mb": 82.65,
+      "load_time_ms": 1522.37,
+      "recovery_success": true
+    },
+    "100000": {
+      "count": 100000,
+      "ram_mb": 390.0,
+      "peak_ram_mb": 439.45,
+      "bm25_index_time_s": 2.522,
+      "dense_p50_ms": 4.16,
+      "dense_p95_ms": 4.82,
+      "dense_p99_ms": 4.98,
+      "bm25_p50_ms": 124.94,
+      "bm25_p95_ms": 191.8,
+      "bm25_p99_ms": 197.0,
+      "hybrid_p50_ms": 129.7,
+      "hybrid_p95_ms": 196.12,
+      "hybrid_p99_ms": 198.55,
+      "save_time_ms": 8558.46,
+      "snap_size_mb": 165.34,
+      "load_time_ms": 2980.85,
+      "recovery_success": true
+    }
+  },
+  "concurrency": {
+    "total_queries": 500,
+    "concurrency_workers": 25,
+    "wall_clock_s": 1.87,
+    "throughput_qps": 267.0,
+    "errors": 0,
+    "p50_ms": 87.28,
+    "p95_ms": 187.97,
+    "p99_ms": 295.12,
+    "mutation_errors": 0
+  },
+  "edge_cases": {
+    "empty_doc_status": "skipped",
+    "space_doc_status": "skipped",
+    "corrupt_pdf_handled": true,
+    "corrupt_json_handled": true,
+    "long_query_latency_ms": 0.96,
+    "large_doc_words": 30000,
+    "large_doc_chunks": 375,
+    "chunking_throughput_words_sec": 1496972
+  },
+  "total_benchmark_time_s": 79.87
+}

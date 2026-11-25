@@ -1,0 +1,119 @@
+{
+  "benchmark_metadata": {
+    "version": "2.1.0",
+    "description": "Fixed multi-category golden evaluation dataset for production RAG verification with dev and held-out test splits, including ground-truth answers for answer correctness evaluation.",
+    "archetypes": [
+      "factual",
+      "multi_hop",
+      "numerical",
+      "negation",
+      "unanswerable_abstain",
+      "ambiguous_followup",
+      "exact_technical_id"
+    ]
+  },
+  "dev_set": [
+    {
+      "id": "dev_01_factual",
+      "category": "factual",
+      "query": "What is Retrieval-Augmented Generation?",
+      "relevant_doc_ids": ["doc_rag_overview"],
+      "ground_truth_answer": "Retrieval-Augmented Generation combines retrieval systems with language models to ground answers in verified external knowledge."
+    },
+    {
+      "id": "dev_02_multihop",
+      "category": "multi_hop",
+      "query": "How does prompt caching help avoid the lost in the middle problem in restricted context windows?",
+      "relevant_doc_ids": ["prompt_caching"],
+      "ground_truth_answer": "By filtering large corpuses down to top pertinent paragraphs and caching prompts, avoiding memory bandwidth bottlenecks and lost in the middle focus degradation."
+    },
+    {
+      "id": "dev_03_numerical",
+      "category": "numerical",
+      "query": "How much RAM does a 4-bit quantized 3B parameter model consume?",
+      "relevant_doc_ids": ["quantization_primer"],
+      "ground_truth_answer": "A 3B parameter model quantized to 4-bit consumes approximately 2.0 GB of RAM."
+    },
+    {
+      "id": "dev_04_negation",
+      "category": "negation",
+      "query": "What should the system do when evidence is lacking in retrieved contexts?",
+      "relevant_doc_ids": ["doc_guardrails"],
+      "ground_truth_answer": "The guardrail triggers abstention and refuses to generate an ungrounded answer."
+    },
+    {
+      "id": "dev_05_unanswerable",
+      "category": "unanswerable_abstain",
+      "query": "What is the standard orbital docking protocol for interplanetary voyages?",
+      "relevant_doc_ids": [],
+      "is_unanswerable": true,
+      "ground_truth_answer": "Insufficient evidence: the corpus does not contain orbital docking protocols."
+    },
+    {
+      "id": "dev_06_ambiguous",
+      "category": "ambiguous_followup",
+      "query": "Compare BM25 and dense retrieval for keyword search.",
+      "relevant_doc_ids": ["doc_vector_index"],
+      "ground_truth_answer": "BM25 uses lexical token matching for exact keywords, whereas dense retrieval uses semantic embedding representations."
+    },
+    {
+      "id": "dev_07_technical_id",
+      "category": "exact_technical_id",
+      "query": "Which models use the GGUF format and AWQ?",
+      "relevant_doc_ids": ["quantization_primer"],
+      "ground_truth_answer": "GGUF format is used by llama.cpp and Ollama, and AWQ performs activation-aware weight quantization."
+    }
+  ],
+  "held_out_test_set": [
+    {
+      "id": "test_01_factual",
+      "category": "factual",
+      "query": "How does cosine similarity calculate context relevance in vector indexing?",
+      "relevant_doc_ids": ["doc_vector_index"],
+      "ground_truth_answer": "Cosine similarity measures the cosine of the angle between query and document vectors in embedding space."
+    },
+    {
+      "id": "test_02_multihop",
+      "category": "multi_hop",
+      "query": "Why does memory bandwidth bottleneck autoregressive token generation in tiny language models?",
+      "relevant_doc_ids": ["prompt_caching"],
+      "ground_truth_answer": "Because memory bandwidth limits token generation speed when feeding oversized context windows."
+    },
+    {
+      "id": "test_03_numerical",
+      "category": "numerical",
+      "query": "What is the typical token context window range for tiny language models?",
+      "relevant_doc_ids": ["prompt_caching"],
+      "ground_truth_answer": "Tiny language models typically have restricted context windows ranging between 2048 and 8192 tokens."
+    },
+    {
+      "id": "test_04_negation",
+      "category": "negation",
+      "query": "Under what condition does the guardrail prompt the model to refuse an answer?",
+      "relevant_doc_ids": ["doc_guardrails"],
+      "ground_truth_answer": "When retrieval similarity scores fall below the threshold or evidence coverage is lacking."
+    },
+    {
+      "id": "test_05_unanswerable",
+      "category": "unanswerable_abstain",
+      "query": "What is the best recipe for baking traditional Neapolitan sourdough pizza?",
+      "relevant_doc_ids": [],
+      "is_unanswerable": true,
+      "ground_truth_answer": "Insufficient evidence: the documentation contains no recipes for sourdough pizza."
+    },
+    {
+      "id": "test_06_ambiguous",
+      "category": "ambiguous_followup",
+      "query": "Which one is better for exact product IDs: BM25 or dense retrieval?",
+      "relevant_doc_ids": ["doc_vector_index"],
+      "ground_truth_answer": "BM25 is significantly better for exact product IDs and technical identifiers due to exact lexical matching."
+    },
+    {
+      "id": "test_07_technical_id",
+      "category": "exact_technical_id",
+      "query": "What precision levels does AWQ reduce model weights from and to?",
+      "relevant_doc_ids": ["quantization_primer"],
+      "ground_truth_answer": "AWQ reduces precision from 16-bit floating point (FP16) to 4-bit or 8-bit integers."
+    }
+  ]
+}

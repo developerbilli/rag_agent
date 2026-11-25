@@ -1,0 +1,1592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Production-Grade Offline RAG Pipeline | Hybrid Search, RRF, Cross-Encoder Reranking</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-dark: #0a0d14;
+      --bg-card: rgba(18, 24, 38, 0.7);
+      --bg-card-hover: rgba(26, 34, 52, 0.85);
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --border-focus: rgba(99, 102, 241, 0.5);
+      --primary: #6366f1;
+      --primary-gradient: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #ec4899 100%);
+      --accent-cyan: #06b6d4;
+      --accent-emerald: #10b981;
+      --accent-rose: #f43f5e;
+      --accent-amber: #f59e0b;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      --font-display: 'Outfit', sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+      --radius-sm: 8px;
+      --radius-md: 14px;
+      --radius-lg: 20px;
+      --shadow-glow: 0 0 25px rgba(99, 102, 241, 0.25);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg-dark);
+      background-image: 
+        radial-gradient(at 10% 20%, rgba(99, 102, 241, 0.12) 0px, transparent 40%),
+        radial-gradient(at 90% 80%, rgba(139, 92, 246, 0.10) 0px, transparent 40%);
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow-x: hidden;
+    }
+
+    /* Top Navigation Header */
+    header {
+      background: rgba(10, 13, 20, 0.8);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border-subtle);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      padding: 0.85rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .brand-logo {
+      width: 38px;
+      height: 38px;
+      border-radius: var(--radius-sm);
+      background: var(--primary-gradient);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--font-display);
+      font-weight: 800;
+      font-size: 1.15rem;
+      box-shadow: 0 4px 15px rgba(99, 102, 241, 0.4);
+    }
+
+    .brand-title {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 1.25rem;
+      letter-spacing: -0.02em;
+      background: linear-gradient(135deg, #ffffff 30%, #cbd5e1 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .brand-badge {
+      font-size: 0.7rem;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      background: rgba(99, 102, 241, 0.15);
+      border: 1px solid rgba(99, 102, 241, 0.3);
+      color: #a5b4fc;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .nav-tabs {
+      display: flex;
+      gap: 0.5rem;
+      background: rgba(255, 255, 255, 0.04);
+      padding: 4px;
+      border-radius: 12px;
+      border: 1px solid var(--border-subtle);
+    }
+
+    .tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      padding: 0.5rem 1rem;
+      border-radius: 8px;
+      font-family: var(--font-sans);
+      font-size: 0.875rem;
+      font-weight: 500;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      transition: all 0.2s ease;
+    }
+
+    .tab-btn:hover {
+      color: var(--text-main);
+      background: rgba(255, 255, 255, 0.06);
+    }
+
+    .tab-btn.active {
+      color: #fff;
+      background: var(--primary);
+      box-shadow: 0 2px 10px rgba(99, 102, 241, 0.4);
+    }
+
+    .system-status {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .status-pill {
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      font-size: 0.78rem;
+      padding: 0.35rem 0.75rem;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border-subtle);
+      border-radius: 9999px;
+      color: var(--text-muted);
+    }
+
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--text-dim);
+    }
+
+    .status-dot.active {
+      background: var(--accent-emerald);
+      box-shadow: 0 0 8px var(--accent-emerald);
+    }
+
+    .status-dot.warning {
+      background: var(--accent-amber);
+      box-shadow: 0 0 8px var(--accent-amber);
+    }
+
+    /* Main Container */
+    main {
+      flex: 1;
+      max-width: 1400px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 1.75rem 2rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+
+    /* Tab Panes */
+    .tab-pane {
+      display: none;
+      animation: fadeIn 0.25s ease forwards;
+    }
+
+    .tab-pane.active {
+      display: block;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Chat View Layout */
+    .chat-layout {
+      display: grid;
+      grid-template-columns: 1fr 340px;
+      gap: 1.5rem;
+      min-height: calc(100vh - 180px);
+    }
+
+    .card {
+      background: var(--bg-card);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .chat-card {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+    }
+
+    .chat-header {
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .chat-title {
+      font-size: 1rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      max-height: calc(100vh - 350px);
+    }
+
+    .message {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+      max-width: 85%;
+      animation: fadeIn 0.2s ease;
+    }
+
+    .message.user {
+      align-self: flex-end;
+    }
+
+    .message.assistant {
+      align-self: flex-start;
+      max-width: 90%;
+    }
+
+    .bubble {
+      padding: 0.85rem 1.15rem;
+      border-radius: var(--radius-md);
+      font-size: 0.92rem;
+      line-height: 1.55;
+    }
+
+    .message.user .bubble {
+      background: var(--primary);
+      color: #fff;
+      border-bottom-right-radius: 4px;
+      box-shadow: 0 4px 15px rgba(99, 102, 241, 0.25);
+    }
+
+    .message.assistant .bubble {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-main);
+      border-bottom-left-radius: 4px;
+    }
+
+    .meta-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      margin-top: 0.25rem;
+      font-size: 0.72rem;
+    }
+
+    .badge-pill {
+      padding: 2px 7px;
+      border-radius: 6px;
+      font-weight: 500;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+    }
+
+    .badge-passed {
+      background: rgba(16, 185, 129, 0.15);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      color: #6ee7b7;
+    }
+
+    .badge-blocked {
+      background: rgba(244, 63, 94, 0.15);
+      border: 1px solid rgba(244, 63, 94, 0.3);
+      color: #fda4af;
+    }
+
+    .badge-backend {
+      background: rgba(99, 102, 241, 0.15);
+      border: 1px solid rgba(99, 102, 241, 0.3);
+      color: #c7d2fe;
+      font-family: var(--font-mono);
+    }
+
+    .citation-tag {
+      background: rgba(6, 182, 212, 0.15);
+      border: 1px solid rgba(6, 182, 212, 0.35);
+      color: #67e8f9;
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      padding: 2px 6px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .citation-tag:hover {
+      background: rgba(6, 182, 212, 0.3);
+      transform: translateY(-1px);
+    }
+
+    /* Chat Input Area */
+    .chat-input-area {
+      padding: 1rem 1.25rem;
+      border-top: 1px solid var(--border-subtle);
+      background: rgba(10, 13, 20, 0.6);
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .quick-chips {
+      display: flex;
+      gap: 0.5rem;
+      overflow-x: auto;
+      padding-bottom: 4px;
+    }
+
+    .chip-btn {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-muted);
+      border-radius: 9999px;
+      padding: 0.3rem 0.8rem;
+      font-size: 0.78rem;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.15s ease;
+    }
+
+    .chip-btn:hover {
+      color: #fff;
+      border-color: rgba(99, 102, 241, 0.4);
+      background: rgba(99, 102, 241, 0.1);
+    }
+
+    .input-row {
+      display: flex;
+      gap: 0.75rem;
+      position: relative;
+    }
+
+    .chat-input {
+      flex: 1;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      padding: 0.85rem 1rem;
+      color: #fff;
+      font-family: var(--font-sans);
+      font-size: 0.95rem;
+      outline: none;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .chat-input:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+    }
+
+    .send-btn {
+      background: var(--primary-gradient);
+      color: #fff;
+      border: none;
+      border-radius: var(--radius-sm);
+      padding: 0 1.5rem;
+      font-weight: 600;
+      font-size: 0.92rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      transition: transform 0.15s ease, box-shadow 0.2s ease;
+      box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
+    }
+
+    .send-btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 20px rgba(99, 102, 241, 0.45);
+    }
+
+    .send-btn:active {
+      transform: translateY(0);
+    }
+
+    /* Controls Sidebar */
+    .controls-panel {
+      padding: 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+    }
+
+    .panel-section-title {
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      color: var(--text-dim);
+      margin-bottom: 0.5rem;
+    }
+
+    .control-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+
+    .control-label {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .select-input, .text-input {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      padding: 0.6rem 0.75rem;
+      color: #fff;
+      font-size: 0.85rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .select-input:focus, .text-input:focus {
+      border-color: var(--primary);
+    }
+
+    .range-input {
+      accent-color: var(--primary);
+      width: 100%;
+      cursor: pointer;
+    }
+
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.4rem 0;
+    }
+
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 42px;
+      height: 24px;
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: rgba(255, 255, 255, 0.1);
+      transition: .3s;
+      border-radius: 24px;
+      border: 1px solid var(--border-subtle);
+    }
+
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 16px;
+      width: 16px;
+      left: 3px;
+      bottom: 3px;
+      background-color: white;
+      transition: .3s;
+      border-radius: 50%;
+    }
+
+    input:checked + .slider {
+      background-color: var(--primary);
+    }
+
+    input:checked + .slider:before {
+      transform: translateX(18px);
+    }
+
+    /* Document Ingestion View */
+    .docs-layout {
+      display: grid;
+      grid-template-columns: 420px 1fr;
+      gap: 1.5rem;
+    }
+
+    .upload-zone {
+      border: 2px dashed rgba(99, 102, 241, 0.35);
+      border-radius: var(--radius-md);
+      padding: 2.5rem 1.5rem;
+      text-align: center;
+      background: rgba(99, 102, 241, 0.04);
+      cursor: pointer;
+      transition: all 0.2s ease;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .upload-zone:hover, .upload-zone.dragover {
+      border-color: var(--primary);
+      background: rgba(99, 102, 241, 0.09);
+      box-shadow: var(--shadow-glow);
+    }
+
+    .upload-icon {
+      font-size: 2.2rem;
+      filter: drop-shadow(0 4px 10px rgba(99, 102, 241, 0.4));
+    }
+
+    .upload-text {
+      font-size: 0.95rem;
+      font-weight: 500;
+    }
+
+    .upload-sub {
+      font-size: 0.78rem;
+      color: var(--text-dim);
+    }
+
+    .docs-table-container {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+      text-align: left;
+    }
+
+    th {
+      background: rgba(255, 255, 255, 0.03);
+      padding: 0.75rem 1rem;
+      color: var(--text-dim);
+      font-weight: 600;
+      border-bottom: 1px solid var(--border-subtle);
+      text-transform: uppercase;
+      font-size: 0.72rem;
+      letter-spacing: 0.05em;
+    }
+
+    td {
+      padding: 0.85rem 1rem;
+      border-bottom: 1px solid var(--border-subtle);
+      vertical-align: middle;
+    }
+
+    tr:hover td {
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    /* Comparison Lab */
+    .compare-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+    }
+
+    .compare-box {
+      padding: 1.25rem;
+      border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--border-subtle);
+      display: flex;
+      flex-direction: column;
+      gap: 0.85rem;
+      min-height: 250px;
+    }
+
+    .compare-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    /* Eval Suite */
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .kpi-card {
+      padding: 1.25rem;
+      border-radius: var(--radius-md);
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+    }
+
+    .kpi-num {
+      font-size: 2rem;
+      font-weight: 800;
+      font-family: var(--font-display);
+      background: var(--primary-gradient);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .kpi-label {
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    /* Modal / Drawer */
+    .modal-backdrop {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.7);
+      backdrop-filter: blur(8px);
+      z-index: 200;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .modal-backdrop.open {
+      display: flex;
+    }
+
+    .modal-box {
+      background: #111726;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      width: 90%;
+      max-width: 650px;
+      max-height: 85vh;
+      overflow-y: auto;
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+      animation: modalSlide 0.2s ease;
+    }
+
+    @keyframes modalSlide {
+      from { transform: scale(0.95); opacity: 0; }
+      to { transform: scale(1); opacity: 1; }
+    }
+
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border-subtle);
+      padding-bottom: 0.75rem;
+    }
+
+    .btn-close {
+      background: transparent;
+      border: none;
+      color: var(--text-dim);
+      font-size: 1.5rem;
+      cursor: pointer;
+      line-height: 1;
+    }
+
+    .btn-close:hover {
+      color: #fff;
+    }
+
+    /* Toast Notification */
+    .toast {
+      position: fixed;
+      bottom: 2rem;
+      right: 2rem;
+      padding: 0.75rem 1.25rem;
+      background: #1e293b;
+      border: 1px solid var(--primary);
+      border-radius: var(--radius-sm);
+      color: #fff;
+      font-size: 0.85rem;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.4);
+      z-index: 300;
+      display: none;
+      animation: fadeIn 0.2s ease;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <div class="brand">
+      <div class="brand-logo">⚡</div>
+      <div>
+        <div class="brand-title">Production RAG Studio</div>
+      </div>
+      <span class="brand-badge">Hybrid Search & Cross-Encoder</span>
+    </div>
+
+    <!-- Navigation Tabs -->
+    <nav class="nav-tabs">
+      <button class="tab-btn active" onclick="switchTab('chat')">💬 Chat & Query</button>
+      <button class="tab-btn" onclick="switchTab('docs')">📁 Knowledge Base</button>
+      <button class="tab-btn" onclick="switchTab('compare')">⚖️ Naive vs RAG Lab</button>
+      <button class="tab-btn" onclick="switchTab('eval')">📈 Recall@K Eval</button>
+    </nav>
+
+    <!-- System Status -->
+    <div class="system-status">
+      <div class="status-pill" id="ollama-status-pill" title="Local Ollama generator status">
+        <span class="status-dot" id="ollama-dot"></span>
+        <span id="ollama-label">Ollama: Checking...</span>
+      </div>
+      <div class="status-pill" id="embed-status-pill" title="Dense vector embedding model">
+        <span class="status-dot active"></span>
+        <span id="embed-label">Embed: Qwen3 (4096d)</span>
+      </div>
+      <div class="status-pill" id="index-status-pill">
+        <span class="status-dot active"></span>
+        <span id="chunks-count-label">0 Chunks Indexed</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main View Area -->
+  <main>
+
+    <!-- TAB 1: Chat & Query -->
+    <section id="tab-chat" class="tab-pane active">
+      <div class="chat-layout">
+        
+        <!-- Conversation Area -->
+        <div class="card chat-card">
+          <div class="chat-header">
+            <div class="chat-title">
+              <span>✦ Conversation Stream</span>
+            </div>
+            <button class="chip-btn" onclick="clearChat()">Clear History</button>
+          </div>
+
+          <div class="chat-messages" id="chat-messages">
+            <!-- Welcome message -->
+            <div class="message assistant">
+              <div class="bubble">
+                <strong>Hello! I am your context-bounded RAG assistant.</strong><br>
+                Ask questions about your indexed documents. Responses cite source chunks and are strictly grounded. Irrelevant queries will be intercepted by guardrails to prevent hallucinations.
+              </div>
+              <div class="meta-bar">
+                <span class="badge-pill badge-passed">🛡️ Guardrail Engine Active</span>
+                <span class="badge-pill badge-backend">Model: Auto</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Input Footer -->
+          <div class="chat-input-area">
+            <div class="quick-chips">
+              <button class="chip-btn" onclick="useQuery('What is Retrieval-Augmented Generation?')">What is RAG?</button>
+              <button class="chip-btn" onclick="useQuery('How does cosine similarity retrieve documents?')">Cosine Similarity</button>
+              <button class="chip-btn" onclick="useQuery('How do guardrails prevent hallucinations?')">Guardrails Faithfulness</button>
+              <button class="chip-btn" onclick="useQuery('How do black holes form in astrophysics?')">🚫 Unrelated Query (Test Guardrail)</button>
+            </div>
+            <div class="input-row">
+              <input type="text" id="user-query-input" class="chat-input" placeholder="Ask a question about your indexed documents..." onkeydown="handleChatKey(event)">
+              <button class="send-btn" id="send-btn" onclick="submitQuery()">
+                <span>Ask</span>
+                <span>→</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Controls Sidebar -->
+        <div class="card controls-panel">
+          <div class="panel-section-title">Generation Model (Writes Text)</div>
+          
+          <div class="control-group">
+            <label class="control-label">Generator Backend</label>
+            <select id="backend-select" class="select-input" onchange="onBackendChange()">
+              <option value="auto">Auto (Ollama → Gemini → Offline)</option>
+              <option value="ollama" selected>Ollama Local LLM</option>
+              <option value="gemini">Google Gemini Cloud API</option>
+              <option value="offline">Built-in Offline Extractive (Instant)</option>
+            </select>
+          </div>
+
+          <div class="control-group" id="ollama-model-group">
+            <label class="control-label">Ollama Text Generator</label>
+            <select id="ollama-model-select" class="select-input">
+              <option value="llama3.2:1b">llama3.2:1b (Active)</option>
+            </select>
+          </div>
+
+          <div class="control-group" id="gemini-key-group" style="display: none;">
+            <label class="control-label">Gemini API Key (Optional)</label>
+            <input type="password" id="gemini-api-key" class="text-input" placeholder="AIzaSy...">
+          </div>
+
+          <hr style="border: 0; border-top: 1px solid var(--border-subtle); margin: 0.5rem 0;">
+
+          <div class="panel-section-title">Embedding Engine (Vector Search)</div>
+          
+          <div class="control-group">
+            <div style="background: rgba(99, 102, 241, 0.08); border: 1px solid rgba(99, 102, 241, 0.25); border-radius: var(--radius-sm); padding: 0.65rem 0.75rem; font-size: 0.82rem; display: flex; flex-direction: column; gap: 0.35rem;">
+              <div style="display: flex; align-items: center; justify-content: space-between;">
+                <span style="font-weight: 600; color: #a5b4fc; font-family: var(--font-mono);" id="sidebar-embed-name">qwen3-embedding</span>
+                <span class="badge-pill badge-passed" style="font-size: 0.65rem;">Active 4096-dim</span>
+              </div>
+              <div style="font-size: 0.72rem; color: var(--text-dim);" id="sidebar-embed-sub">Dense neural vectors via Ollama</div>
+            </div>
+            <div style="font-size: 0.7rem; color: var(--text-dim); margin-top: 0.2rem; line-height: 1.4;">
+              💡 <em>Embedding models calculate mathematical vectors to retrieve chunks. They cannot generate chat text.</em>
+            </div>
+          </div>
+
+          <hr style="border: 0; border-top: 1px solid var(--border-subtle); margin: 0.5rem 0;">
+
+          <div class="panel-section-title">RAG & Guardrail Tuning</div>
+
+          <div class="control-group">
+            <div class="control-label">
+              <span>Top-K Context Chunks</span>
+              <span id="top-k-val" style="font-family: var(--font-mono); color: var(--primary);">3</span>
+            </div>
+            <input type="range" id="top-k-slider" class="range-input" min="1" max="8" value="3" oninput="document.getElementById('top-k-val').innerText = this.value">
+          </div>
+
+          <div class="control-group">
+            <div class="control-label">
+              <span>Guardrail Confidence Threshold</span>
+              <span id="threshold-val" style="font-family: var(--font-mono); color: var(--accent-emerald);">0.20</span>
+            </div>
+            <input type="range" id="threshold-slider" class="range-input" min="0.05" max="0.75" step="0.05" value="0.20" oninput="document.getElementById('threshold-val').innerText = parseFloat(this.value).toFixed(2)">
+          </div>
+
+          <div class="toggle-row">
+            <span style="font-size: 0.82rem; color: var(--text-muted);">Enforce Strict Guardrails</span>
+            <label class="switch">
+              <input type="checkbox" id="enforce-guardrails" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <button class="chip-btn" style="margin-top: auto; text-align: center; justify-content: center; padding: 0.6rem;" onclick="openPromptViewer()">
+            🔍 View Assembled Prompt
+          </button>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- TAB 2: Knowledge Base & Ingestion -->
+    <section id="tab-docs" class="tab-pane">
+      <div class="docs-layout">
+        
+        <!-- Left Ingestion Tools -->
+        <div class="card" style="padding: 1.5rem; gap: 1.25rem;">
+          <h3 style="font-size: 1.1rem; font-weight: 600;">Ingest Documents</h3>
+          
+          <!-- Drag and Drop Upload -->
+          <div class="upload-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
+            <div class="upload-icon">📄</div>
+            <div class="upload-text">Drop PDF, TXT, MD, Code, or Data files here</div>
+            <div class="upload-sub">PDF, TXT, MD, Python, JS, JSON, CSV, and more</div>
+            <input type="file" id="file-input" multiple accept=".pdf,.txt,.md,.markdown,.py,.js,.jsx,.ts,.tsx,.json,.csv,.tsv,.html,.css,.xml,.yaml,.yml,.sh,.bash,.sql" style="display: none;" onchange="handleFileUpload(event)">
+          </div>
+
+          <div style="text-align: center; color: var(--text-dim); font-size: 0.8rem;">— OR INGEST LOCAL FOLDER —</div>
+
+          <!-- Folder path input -->
+          <div class="control-group">
+            <label class="control-label">Local Folder Path</label>
+            <div style="display: flex; gap: 0.5rem;">
+              <input type="text" id="folder-path-input" class="text-input" style="flex: 1;" placeholder="./sample_data" value="./sample_data">
+              <button class="send-btn" style="padding: 0 1rem;" onclick="ingestFolder()">Scan</button>
+            </div>
+          </div>
+
+          <hr style="border: 0; border-top: 1px solid var(--border-subtle); margin: 0.5rem 0;">
+
+          <div style="display: flex; gap: 0.5rem;">
+            <button class="chip-btn" style="flex: 1; justify-content: center; color: var(--accent-rose); border-color: rgba(244, 63, 94, 0.3);" onclick="clearAllIndex()">
+              🗑️ Reset All Chunks
+            </button>
+            <button class="chip-btn" style="flex: 1; justify-content: center;" onclick="refreshIndexStatus()">
+              🔄 Refresh List
+            </button>
+          </div>
+        </div>
+
+        <!-- Right Indexed Chunks Table -->
+        <div class="card" style="padding: 1.5rem;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+            <h3 style="font-size: 1.1rem; font-weight: 600;">Indexed Memory Store</h3>
+            <input type="text" id="chunk-search" class="text-input" placeholder="Search chunk text..." style="width: 240px; padding: 0.4rem 0.75rem;" oninput="filterChunks(this.value)">
+          </div>
+
+          <div class="docs-table-container">
+            <table id="chunks-table">
+              <thead>
+                <tr>
+                  <th>Chunk ID</th>
+                  <th>Doc Title</th>
+                  <th>Word Span</th>
+                  <th>Preview Content</th>
+                </tr>
+              </thead>
+              <tbody id="chunks-tbody">
+                <tr><td colspan="4" style="text-align: center; color: var(--text-dim);">Loading indexed chunks...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- TAB 3: Comparison Lab -->
+    <section id="tab-compare" class="tab-pane">
+      <div class="card" style="padding: 1.5rem; margin-bottom: 1.5rem;">
+        <h3 style="font-size: 1.1rem; font-weight: 600; margin-bottom: 0.5rem;">Side-by-Side: Naive vs RAG Augmented</h3>
+        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;">
+          Witness how un-augmented tiny models fail or hallucinate when context is missing, versus how RAG grounds the answer in factual source citations.
+        </p>
+        <div style="display: flex; gap: 0.75rem;">
+          <input type="text" id="compare-query-input" class="chat-input" placeholder="Enter query to compare (e.g. 'What is quantization in tiny models?')...">
+          <button class="send-btn" onclick="runComparison()">Run Comparison</button>
+        </div>
+      </div>
+
+      <div class="compare-grid">
+        <!-- Naive Box -->
+        <div class="compare-box">
+          <div class="compare-title">
+            <span>❌ Phase 1: Naive Baseline</span>
+            <span class="badge-pill badge-blocked">No Retrieval</span>
+          </div>
+          <p style="font-size: 0.78rem; color: var(--text-dim);">Simulates model answering strictly from frozen weights without external context.</p>
+          <div id="compare-naive-result" style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; flex: 1; font-size: 0.9rem; line-height: 1.5;">
+            Run a query above to see baseline output.
+          </div>
+        </div>
+
+        <!-- RAG Box -->
+        <div class="compare-box" style="border-color: rgba(99, 102, 241, 0.4);">
+          <div class="compare-title">
+            <span>✅ Phase 3 & 4: Guarded RAG</span>
+            <span class="badge-pill badge-passed">Context Grounded</span>
+          </div>
+          <p style="font-size: 0.78rem; color: var(--text-dim);">Retrieves top-k vector chunks, applies confidence guardrail, and builds citations.</p>
+          <div id="compare-rag-result" style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; flex: 1; font-size: 0.9rem; line-height: 1.5;">
+            Run a query above to see RAG output.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: Evaluation Suite -->
+    <section id="tab-eval" class="tab-pane">
+      <div class="kpi-row">
+        <div class="kpi-card">
+          <div class="kpi-num" id="kpi-recall">0%</div>
+          <div class="kpi-label">Recall@K Score</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-num" id="kpi-hits">0</div>
+          <div class="kpi-label">Successful Hits</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-num" id="kpi-total">0</div>
+          <div class="kpi-label">Evaluated Queries</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-num" id="kpi-k">3</div>
+          <div class="kpi-label">K Parameter</div>
+        </div>
+      </div>
+
+      <div class="card" style="padding: 1.5rem;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+          <div>
+            <h3 style="font-size: 1.1rem; font-weight: 600;">Recall@K Retrieval Evaluation Harness</h3>
+            <p style="font-size: 0.8rem; color: var(--text-dim);">Tests whether expected relevant documents land in top-k retrieval results.</p>
+          </div>
+          <button class="send-btn" onclick="runEvaluation()">▶ Run Benchmark</button>
+        </div>
+
+        <table id="eval-table">
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Test Query</th>
+              <th>Expected Doc ID</th>
+              <th>Retrieved Top-K IDs</th>
+            </tr>
+          </thead>
+          <tbody id="eval-tbody">
+            <tr><td colspan="4" style="text-align: center; color: var(--text-dim);">Click 'Run Benchmark' to execute the test harness.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Citation Inspector Modal -->
+  <div class="modal-backdrop" id="citation-modal" onclick="closeModal(event)">
+    <div class="modal-box" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <h4 id="modal-title" style="font-family: var(--font-mono); font-size: 0.95rem; color: var(--accent-cyan);">Chunk Inspector</h4>
+        <button class="btn-close" onclick="closeModal()">×</button>
+      </div>
+      <div>
+        <div style="font-size: 0.78rem; color: var(--text-dim); margin-bottom: 0.3rem;">DOCUMENT TITLE</div>
+        <div id="modal-doc-title" style="font-weight: 600; margin-bottom: 0.8rem;"></div>
+
+        <div style="font-size: 0.78rem; color: var(--text-dim); margin-bottom: 0.3rem;">MATCH SIMILARITY SCORE</div>
+        <div id="modal-score" style="font-family: var(--font-mono); color: var(--accent-emerald); font-weight: 600; margin-bottom: 0.8rem;"></div>
+
+        <div style="font-size: 0.78rem; color: var(--text-dim); margin-bottom: 0.3rem;">RAW CHUNK TEXT</div>
+        <div id="modal-text" style="background: rgba(0,0,0,0.3); border: 1px solid var(--border-subtle); padding: 1rem; border-radius: 8px; font-size: 0.88rem; line-height: 1.6; white-space: pre-wrap;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Prompt Inspector Modal -->
+  <div class="modal-backdrop" id="prompt-modal" onclick="closePromptModal(event)">
+    <div class="modal-box" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <h4 style="font-family: var(--font-display); font-size: 1.05rem;">Last Assembled Context Prompt</h4>
+        <button class="btn-close" onclick="closePromptModal()">×</button>
+      </div>
+      <div id="prompt-modal-text" style="background: rgba(0,0,0,0.35); border: 1px solid var(--border-subtle); padding: 1rem; border-radius: 8px; font-family: var(--font-mono); font-size: 0.8rem; line-height: 1.5; white-space: pre-wrap; max-height: 60vh; overflow-y: auto;">
+        No prompt generated yet. Ask a query first!
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast">Notification</div>
+
+  <script>
+    let currentChunks = [];
+    let lastAssembledPrompt = "";
+    let currentSessionId = 'ui_session_' + Math.random().toString(36).substring(2, 9);
+
+    // Tab Switching
+    function switchTab(tabId) {
+      document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+      document.getElementById('tab-' + tabId).classList.add('active');
+      event.target.classList.add('active');
+
+      if (tabId === 'docs') refreshIndexStatus();
+    }
+
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.innerText = msg;
+      t.style.display = 'block';
+      setTimeout(() => { t.style.display = 'none'; }, 3200);
+    }
+
+    // Backend selection
+    function onBackendChange() {
+      const val = document.getElementById('backend-select').value;
+      document.getElementById('ollama-model-group').style.display = (val === 'ollama') ? 'flex' : 'none';
+      document.getElementById('gemini-key-group').style.display = (val === 'gemini') ? 'flex' : 'none';
+    }
+
+    // Check System Models on Load
+    async function checkModelStatus() {
+      try {
+        const res = await fetch('/models-status');
+        const data = await res.json();
+        
+        // Ollama
+        const ollamaDot = document.getElementById('ollama-dot');
+        const ollamaLabel = document.getElementById('ollama-label');
+        const embedLabel = document.getElementById('embed-label');
+        if (data.ollama && data.ollama.running) {
+          ollamaDot.className = 'status-dot active';
+          const count = data.ollama.models.length;
+          ollamaLabel.innerText = count > 0 ? `Ollama (${data.ollama.models[0].split(':')[0]})` : 'Ollama: Online';
+          
+          if (data.ollama.embedding_models && data.ollama.embedding_models.length > 0) {
+            const embName = data.ollama.embedding_models[0].split(':')[0];
+            if (embedLabel) embedLabel.innerText = `Embed: ${embName} (4096d)`;
+            const sbName = document.getElementById('sidebar-embed-name');
+            if (sbName) sbName.innerText = embName;
+          } else {
+            if (embedLabel) embedLabel.innerText = 'Embed: TF-IDF';
+          }
+
+          // Populate select with generator models only
+          const select = document.getElementById('ollama-model-select');
+          if (data.ollama.models.length > 0) {
+            const currentSelected = select.value;
+            select.innerHTML = '';
+            data.ollama.models.forEach(m => {
+              const opt = document.createElement('option');
+              opt.value = m;
+              opt.innerText = m;
+              select.appendChild(opt);
+            });
+            if (currentSelected && data.ollama.models.includes(currentSelected)) {
+              select.value = currentSelected;
+            }
+          }
+        } else {
+          ollamaDot.className = 'status-dot';
+          ollamaLabel.innerText = 'Ollama: Offline';
+          if (embedLabel) embedLabel.innerText = 'Embed: TF-IDF';
+          const sbName = document.getElementById('sidebar-embed-name');
+          if (sbName) sbName.innerText = 'TF-IDF Vectorizer (CPU)';
+        }
+
+        // Chunks
+        document.getElementById('chunks-count-label').innerText = `${data.index.total_chunks} Chunks Indexed`;
+      } catch (e) {
+        console.error('Status fetch failed:', e);
+        const ollamaDot = document.getElementById('ollama-dot');
+        const ollamaLabel = document.getElementById('ollama-label');
+        if (ollamaDot) ollamaDot.className = 'status-dot';
+        if (ollamaLabel) ollamaLabel.innerText = 'Server Offline';
+      }
+    }
+
+    // Refresh Index Status
+    async function refreshIndexStatus() {
+      try {
+        const res = await fetch('/index-status');
+        const data = await res.json();
+        currentChunks = data.chunks || [];
+        const countLabel = document.getElementById('chunks-count-label');
+        if (countLabel) countLabel.innerText = `${currentChunks.length} Chunks Indexed`;
+        
+        const searchInput = document.getElementById('chunk-search');
+        if (searchInput && searchInput.value.trim()) {
+          filterChunks(searchInput.value);
+        } else {
+          renderChunksTable(currentChunks);
+        }
+      } catch (e) {
+        console.error('Failed to load chunks:', e);
+      }
+    }
+
+    function renderChunksTable(chunks) {
+      const tbody = document.getElementById('chunks-tbody');
+      if (!tbody) return;
+      if (!chunks || chunks.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-dim); padding: 2rem 1rem;">No chunks indexed yet. Ingest documents or sample files!</td></tr>';
+        return;
+      }
+      tbody.innerHTML = chunks.map(c => {
+        const safeChunkId = escapeHtml(c.chunk_id || '');
+        const safeTitle = escapeHtml(c.title || c.doc_id || 'Untitled');
+        const safeText = escapeHtml(c.text || '');
+        const cleanChunkIdJs = (c.chunk_id || '').replace(/['"\\]/g, '');
+        return `
+          <tr>
+            <td><span class="citation-tag" onclick="inspectChunk('${cleanChunkIdJs}')">${safeChunkId}</span></td>
+            <td style="font-weight: 500;">${safeTitle}</td>
+            <td style="color: var(--text-dim); font-family: var(--font-mono); font-size: 0.78rem;">${c.start_word ?? 0} - ${c.end_word ?? 0}</td>
+            <td style="color: var(--text-muted); max-width: 450px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${safeText}">${safeText}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function filterChunks(query) {
+      const q = (query || '').toLowerCase().trim();
+      if (!q) {
+        renderChunksTable(currentChunks);
+        return;
+      }
+      const filtered = currentChunks.filter(c => 
+        (c.text && c.text.toLowerCase().includes(q)) ||
+        (c.title && c.title.toLowerCase().includes(q)) ||
+        (c.chunk_id && c.chunk_id.toLowerCase().includes(q))
+      );
+      renderChunksTable(filtered);
+    }
+
+    // Ingest Folder
+    async function ingestFolder() {
+      const folderPath = document.getElementById('folder-path-input').value.trim();
+      if (!folderPath) return;
+
+      showToast(`Scanning folder ${folderPath}...`);
+      try {
+        const res = await fetch('/ingest-folder', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ folder_path: folderPath, recursive: true })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          showToast(`Ingested ${data.documents_processed} docs (${data.chunks_created} chunks)!`);
+          refreshIndexStatus();
+        } else {
+          showToast(`Error: ${data.detail || 'Folder not found'}`);
+        }
+      } catch (e) {
+        showToast(`Failed: ${e.message}`);
+      }
+    }
+
+    // Clear All Index
+    async function clearAllIndex() {
+      if (!confirm("Are you sure you want to clear the entire vector index?")) return;
+      try {
+        await fetch('/clear-index', { method: 'POST' });
+        showToast('Vector index cleared!');
+        refreshIndexStatus();
+      } catch (e) {
+        showToast('Clear failed.');
+      }
+    }
+
+    // File Upload
+    async function handleFileUpload(event) {
+      const inputEl = document.getElementById('file-input');
+      const files = event.target ? event.target.files : event.files;
+      if (!files || files.length === 0) return;
+
+      const formData = new FormData();
+      for (let i = 0; i < files.length; i++) {
+        formData.append('files', files[i]);
+      }
+
+      showToast(`Uploading and chunking ${files.length} file(s)...`);
+      try {
+        const res = await fetch('/upload', {
+          method: 'POST',
+          body: formData
+        });
+        const data = await res.json();
+        if (res.ok) {
+          if (data.chunks_created > 0) {
+            showToast(`Ingested ${data.files_processed} file(s) (${data.chunks_created} new chunks indexed)!`);
+          } else {
+            showToast(`Warning: 0 chunks created. Check file contents.`);
+          }
+          await refreshIndexStatus();
+        } else {
+          showToast(`Upload failed: ${data.detail || 'Server error'}`);
+        }
+      } catch (e) {
+        if (e.message && e.message.includes('Failed to fetch')) {
+          showToast('Upload error: Backend server unreachable. Check that FastAPI/uvicorn is running on port 8000.');
+        } else {
+          showToast(`Upload error: ${e.message}`);
+        }
+      } finally {
+        if (inputEl) inputEl.value = '';
+      }
+    }
+
+    // Drag and drop events
+    const dropZone = document.getElementById('drop-zone');
+    ['dragenter', 'dragover'].forEach(name => {
+      dropZone.addEventListener(name, (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
+    });
+    ['dragleave', 'drop'].forEach(name => {
+      dropZone.addEventListener(name, (e) => { e.preventDefault(); dropZone.classList.remove('dragover'); });
+    });
+    dropZone.addEventListener('drop', (e) => {
+      const dt = e.dataTransfer;
+      const files = dt.files;
+      if (files.length > 0) {
+        document.getElementById('file-input').files = files;
+        handleFileUpload({ target: { files: files } });
+      }
+    });
+
+    // Chat handling
+    function useQuery(q) {
+      document.getElementById('user-query-input').value = q;
+      submitQuery();
+    }
+
+    function handleChatKey(e) {
+      if (e.key === 'Enter') submitQuery();
+    }
+
+    async function submitQuery() {
+      const input = document.getElementById('user-query-input');
+      const query = input.value.trim();
+      if (!query) return;
+
+      input.value = '';
+      const chatBox = document.getElementById('chat-messages');
+
+      // Append user bubble
+      chatBox.innerHTML += `
+        <div class="message user">
+          <div class="bubble">${escapeHtml(query)}</div>
+        </div>
+      `;
+      chatBox.scrollTop = chatBox.scrollHeight;
+
+      // Parameters
+      const topK = parseInt(document.getElementById('top-k-slider').value);
+      const threshold = parseFloat(document.getElementById('threshold-slider').value);
+      const backend = document.getElementById('backend-select').value;
+      const model = document.getElementById('ollama-model-select').value;
+      const apiKey = document.getElementById('gemini-api-key').value;
+      const enforceGuardrails = document.getElementById('enforce-guardrails').checked;
+
+      const endpoint = enforceGuardrails ? '/generate-guarded' : '/generate-rag';
+
+      // Append temporary loading
+      const loadingId = 'loading-' + Date.now();
+      chatBox.innerHTML += `
+        <div class="message assistant" id="${loadingId}">
+          <div class="bubble" style="color: var(--text-dim); display: flex; align-items: center; gap: 0.5rem;">
+            <span>Retrieving context & generating answer...</span>
+          </div>
+        </div>
+      `;
+      chatBox.scrollTop = chatBox.scrollHeight;
+
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            query: query,
+            top_k: topK,
+            threshold: threshold,
+            backend: backend,
+            model: model,
+            api_key: apiKey || null,
+            session_id: currentSessionId,
+            use_memory: true
+          })
+        });
+
+        const data = await res.json();
+        document.getElementById(loadingId).remove();
+
+        if (data.prompt) lastAssembledPrompt = data.prompt;
+
+        const isBlocked = data.status === 'BLOCKED_BY_GUARDRAIL';
+        const guardrailBadge = isBlocked 
+          ? `<span class="badge-pill badge-blocked">🚫 Guardrail Blocked</span>` 
+          : `<span class="badge-pill badge-passed">🛡️ Guardrail Passed</span>`;
+
+        const citationsHtml = (data.provenance && data.provenance.length > 0)
+          ? data.provenance.map(cid => `<span class="citation-tag" onclick="inspectChunk('${cid}')">[${cid}]</span>`).join(' ')
+          : '<span style="color: var(--text-dim);">No Citations</span>';
+
+        const backendBadge = `<span class="badge-pill badge-backend">⚡ ${data.backend_used || backend} (${data.model_used || 'auto'})</span>`;
+
+        const turnBadge = (data.history_turn_count !== undefined)
+          ? `<span class="badge-pill" style="background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(192, 132, 252, 0.3);">💬 Turn ${data.history_turn_count + 1}</span>`
+          : '';
+
+        const rewrittenPill = (data.standalone_query && data.standalone_query.trim().toLowerCase() !== query.trim().toLowerCase())
+          ? `<div style="margin-bottom: 0.5rem;"><span class="badge-pill" style="background: rgba(14, 165, 233, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); font-size: 0.76rem;">🔍 Rewritten Query: "${escapeHtml(data.standalone_query)}"</span></div>`
+          : '';
+
+        chatBox.innerHTML += `
+          <div class="message assistant">
+            ${rewrittenPill}
+            <div class="bubble">${escapeHtml(data.answer)}</div>
+            <div class="meta-bar">
+              ${guardrailBadge}
+              ${backendBadge}
+              ${turnBadge}
+              <span>Sources: ${citationsHtml}</span>
+            </div>
+          </div>
+        `;
+        chatBox.scrollTop = chatBox.scrollHeight;
+
+      } catch (e) {
+        document.getElementById(loadingId).remove();
+        chatBox.innerHTML += `
+          <div class="message assistant">
+            <div class="bubble" style="border-color: var(--accent-rose); color: var(--accent-rose);">
+              Error generating response: ${e.message}
+            </div>
+          </div>
+        `;
+      }
+    }
+
+    async function clearChat() {
+      try {
+        await fetch(`/sessions/${currentSessionId}`, { method: 'DELETE' });
+      } catch (e) {}
+      currentSessionId = 'ui_session_' + Math.random().toString(36).substring(2, 9);
+      document.getElementById('chat-messages').innerHTML = `
+        <div class="message assistant">
+          <div class="bubble">History cleared. Fresh conversation session started!</div>
+        </div>
+      `;
+    }
+
+    // Comparison Lab
+    async function runComparison() {
+      const q = document.getElementById('compare-query-input').value.trim();
+      if (!q) return;
+
+      document.getElementById('compare-naive-result').innerText = 'Generating naive output...';
+      document.getElementById('compare-rag-result').innerText = 'Retrieving & generating grounded output...';
+
+      try {
+        const [naiveRes, ragRes] = await Promise.all([
+          fetch('/generate-naive', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ query: q })
+          }).then(r => r.json()),
+          fetch('/generate-guarded', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ query: q, top_k: 3 })
+          }).then(r => r.json())
+        ]);
+
+        document.getElementById('compare-naive-result').innerText = naiveRes.answer;
+        
+        let ragText = ragRes.answer;
+        if (ragRes.status === 'BLOCKED_BY_GUARDRAIL') {
+          ragText += `\n\n[Status: BLOCKED_BY_GUARDRAIL — Reason: ${ragRes.reason}]`;
+        }
+        document.getElementById('compare-rag-result').innerText = ragText;
+      } catch (e) {
+        showToast('Comparison failed: ' + e.message);
+      }
+    }
+
+    // Evaluation Benchmark
+    async function runEvaluation() {
+      showToast('Running Recall@K benchmark on test suite...');
+      const evalDataset = [
+        {"query": "What is Retrieval-Augmented Generation?", "relevant_doc_ids": ["doc_rag_overview"]},
+        {"query": "How does dense vector indexing work?", "relevant_doc_ids": ["doc_vector_index"]},
+        {"query": "How do guardrails detect confidence?", "relevant_doc_ids": ["doc_guardrails"]},
+        {"query": "Explain model quantization for tiny models", "relevant_doc_ids": ["quantization_primer"]},
+        {"query": "Tell me about prompt caching and context windows", "relevant_doc_ids": ["prompt_caching"]}
+      ];
+
+      try {
+        const res = await fetch('/eval-recall', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ dataset: evalDataset, k: 3 })
+        });
+        const data = await res.json();
+        const metrics = data.metrics;
+
+        document.getElementById('kpi-recall').innerText = `${Math.round(metrics.recall_at_k * 100)}%`;
+        document.getElementById('kpi-hits').innerText = metrics.hits;
+        document.getElementById('kpi-total').innerText = metrics.total_queries;
+        document.getElementById('kpi-k').innerText = metrics.k;
+
+        const tbody = document.getElementById('eval-tbody');
+        tbody.innerHTML = metrics.details.map(d => `
+          <tr>
+            <td>${d.hit ? '<span class="badge-pill badge-passed">✓ HIT</span>' : '<span class="badge-pill badge-blocked">✗ MISS</span>'}</td>
+            <td style="font-weight: 500;">${escapeHtml(d.query)}</td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem;">${d.expected.join(', ')}</td>
+            <td style="font-family: var(--font-mono); font-size: 0.78rem; color: var(--accent-cyan);">${d.retrieved.join(', ')}</td>
+          </tr>
+        `).join('');
+
+        showToast(`Benchmark complete: Recall@3 = ${Math.round(metrics.recall_at_k * 100)}%`);
+      } catch (e) {
+        showToast('Evaluation failed: ' + e.message);
+      }
+    }
+
+    // Modal Inspection
+    function inspectChunk(chunkId) {
+      const chunk = currentChunks.find(c => c.chunk_id === chunkId);
+      if (!chunk) {
+        // Fallback fetch
+        fetch('/retrieve', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ query: chunkId, top_k: 1 })
+        }).then(r => r.json()).then(data => {
+          if (data.retrieved_chunks && data.retrieved_chunks.length > 0) {
+            showModal(data.retrieved_chunks[0]);
+          } else {
+            showToast('Chunk details not found in cache.');
+          }
+        });
+        return;
+      }
+      showModal(chunk);
+    }
+
+    function showModal(chunk) {
+      document.getElementById('modal-title').innerText = `Provenance: ${chunk.chunk_id}`;
+      document.getElementById('modal-doc-title').innerText = chunk.title || chunk.doc_id;
+      document.getElementById('modal-score').innerText = chunk.score ? `Cosine Similarity: ${chunk.score.toFixed(4)}` : 'Score: In Knowledge Base';
+      document.getElementById('modal-text').innerText = chunk.text;
+      document.getElementById('citation-modal').classList.add('open');
+    }
+
+    function closeModal() {
+      document.getElementById('citation-modal').classList.remove('open');
+    }
+
+    function openPromptViewer() {
+      document.getElementById('prompt-modal-text').innerText = lastAssembledPrompt || "No prompt generated yet. Send a message in chat first!";
+      document.getElementById('prompt-modal').classList.add('open');
+    }
+
+    function closePromptModal() {
+      document.getElementById('prompt-modal').classList.remove('open');
+    }
+
+    function escapeHtml(text) {
+      if (!text) return '';
+      return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    // Startup
+    window.addEventListener('DOMContentLoaded', () => {
+      checkModelStatus();
+      refreshIndexStatus();
+    });
+  </script>
+</body>
+</html>
