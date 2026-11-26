@@ -428,5 +428,22 @@ Allowing multi-turn conversation memory without cryptographic or principal-scope
 
 ---
 
+## Production Security: Document-Level Authorization on Index Telemetry (`/index-status`)
+
+Merely omitting raw document text from operational diagnostic endpoints is insufficient if document metadata (internal IDs, titles, departments, clearance classifications, version records) remains unfiltered. Unauthorized callers could enumerate sensitive corporate documents without permission.
+
+### Implementation Safeguards (`main.py`):
+1. **Pre-Evaluation of Authorized Documents**:
+   - Evaluates caller's verified `AuthenticatedPrincipal` claims against `MetadataFilterEngine` and `get_document_status()` for all indexed source documents and version registry entries.
+2. **Chunk and Registry Filtering**:
+   - Ordinary users only receive telemetry entries for chunks belonging to active, authorized documents matching their roles, clearance, and department.
+   - Version registry entries for restricted or soft-deleted documents are completely omitted from the response.
+3. **Privilege Escalation Blocking**:
+   - Unauthenticated/untrusted caller-supplied headers (`X-User-Role`, `X-Clearance-Level`) and query params (`role=admin`) are blocked, enforcing server-side identity verification.
+4. **Administrative Audit Controls**:
+   - Administrators can review soft-deleted documents via `include_deleted=true` and export raw chunk text for verification via `include_text=true`.
+
+---
+
 ## Conclusion
 Our project architecture provides concrete, production-grade implementations for each of these 10 areas, balancing lightweight local edge constraints (running smoothly on Apple Silicon with 16 GB RAM) with enterprise-level robustness.

@@ -177,7 +177,7 @@ If neither Ollama nor a cloud key is present, TinyRAG automatically uses its zer
 | `/ingest` | `POST` | Phase 2: Ingest JSON document list |
 | `/upload` | `POST` | Phase 2: Upload `.pdf`, `.md`, `.txt` files directly |
 | `/ingest-folder` | `POST` | Phase 2: Scan and ingest all files in a folder path |
-| `/index-status` | `GET` | Inspect all chunks currently in memory |
+| `/index-status` | `GET` | Operational index status & telemetry (RBAC/ABAC and lifecycle filtered) |
 | `/clear-index` | `POST` | Reset in-memory vector index |
 | `/retrieve` | `POST` | Phase 3: Retrieve top-k context chunks (hybrid BM25+Dense+RRF, dense, bm25) |
 | `/generate-rag` | `POST` | Phase 3: Retrieve (hybrid/dense/bm25) and generate answer with provenance & session memory |
@@ -230,3 +230,5 @@ The pipeline provides configurable authentication modes via `RAG_AUTH_MODE=devel
   - Document lifecycle operations record audit trails (`principal_id`, `doc_id`, `operation`, `result`).
 - **Complete Principal Session Isolation**:
   - All conversation memory lookups across generation (`/generate-rag`, `/generate-guarded`), query classification (`/route-query`), and auto-routing (`/retrieve`) strictly enforce internal principal-scoped session IDs (`<principal_id>:<session_id>`), preventing cross-user history exposure or routing poisoning.
+- **Document-Level Authorization on Index Telemetry (`/index-status`)**:
+  - Chunks and version registry entries returned by `/index-status` are strictly filtered by the authenticated principal's access context (roles, clearance, department, and lifecycle state), preventing metadata leakage (titles, classifications, department names, document IDs) of unauthorized documents to ordinary users. Full text inspection requires administrative privileges (`include_text=true`).

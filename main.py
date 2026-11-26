@@ -1292,18 +1292,75 @@ def clear_index(principal: AuthenticatedPrincipal = Depends(get_current_principa
 @protected_router.get("/index-status")
 def index_status(
     include_text: bool = Query(False),
-    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+    include_deleted: Optional[bool] = Query(False),
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    x_clearance_level: Optional[str] = Header(None, alias="X-Clearance-Level"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-ID"),
+    role: Optional[str] = Query(None),
+    clearance_level: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None)
 ):
     """
     Operational index status and health diagnostics.
-    Omits full document text to prevent sensitive data leakage.
-    Full text export requires administrator privileges and explicit include_text=true.
+    Enforces Document-Level Access Control (RBAC/ABAC) and Lifecycle filtering:
+    - Identity and permissions are derived strictly server-side from the authenticated principal.
+    - Caller-supplied privilege escalation headers and query parameters are blocked/ignored.
+    - Chunks and version registry entries are strictly filtered against the caller's access context.
+    - Ordinary users only see chunks and metadata for documents they are authorized to access.
+    - Full text export requires administrator privileges and explicit include_text=true.
     """
-    reg = getattr(indexer, 'version_registry', None)
-    allow_full_text = include_text and principal.is_admin()
+    if x_user_role or role or x_clearance_level or clearance_level or x_user_id or user_id:
+        logger.warning(
+            f"[Security Audit] Blocked caller-supplied privilege escalation headers/query parameters on /index-status. "
+            f"Enforcing authenticated principal claims: principal_id='{principal.principal_id}', roles={principal.roles}."
+        )
 
+    reg = getattr(indexer, 'version_registry', None)
+    is_admin = principal.is_admin()
+    user_ctx = principal.to_user_context()
+    allow_deleted = bool(include_deleted and is_admin)
+    allow_full_text = bool(include_text and is_admin)
+
+    # 1. Determine authorized document IDs across source documents and version registry
+    all_known_doc_ids = set()
+    if hasattr(indexer, 'source_documents') and indexer.source_documents:
+        all_known_doc_ids.update(indexer.source_documents.keys())
+    if reg and hasattr(reg, 'registry') and reg.registry:
+        all_known_doc_ids.update(reg.registry.keys())
+
+    if is_admin and allow_deleted:
+        authorized_doc_ids = set(all_known_doc_ids)
+    else:
+        authorized_doc_ids = {
+            doc_id for doc_id in all_known_doc_ids
+            if indexer.get_document_status(doc_id, user_context=user_ctx, include_deleted=allow_deleted) is not None
+        }
+
+    # 2. Filter version registry entries using principal's access context
+    if reg and hasattr(reg, 'registry') and reg.registry:
+        if is_admin and allow_deleted:
+            filtered_registry = dict(reg.registry)
+        else:
+            filtered_registry = {
+                doc_id: v for doc_id, v in reg.registry.items()
+                if doc_id in authorized_doc_ids
+            }
+    else:
+        filtered_registry = {}
+
+    # 3. Filter chunks based on document authorization and chunk access control / lifecycle
     chunks_telemetry = []
     for c in indexer.chunks:
+        doc_id = c.get("doc_id")
+        if not (is_admin and allow_deleted):
+            # Enforce document-level authorization
+            if doc_id and doc_id in all_known_doc_ids and doc_id not in authorized_doc_ids:
+                continue
+            # Enforce chunk-level access control & lifecycle
+            if not MetadataFilterEngine.matches(c, user_context=user_ctx, include_deleted=allow_deleted):
+                continue
+
         entry = {
             "chunk_id": c.get("chunk_id"),
             "doc_id": c.get("doc_id"),
@@ -1314,14 +1371,20 @@ def index_status(
             entry["text"] = c.get("text", "")
         chunks_telemetry.append(entry)
 
+    source_docs = getattr(indexer, 'source_documents', {})
+    if is_admin and allow_deleted:
+        source_docs_count = len(source_docs)
+    else:
+        source_docs_count = sum(1 for d in source_docs.keys() if d in authorized_doc_ids)
+
     return {
-        "total_indexed_chunks": len(indexer.chunks),
+        "total_indexed_chunks": len(chunks_telemetry),
         "index_generation": getattr(indexer, 'index_generation', 1),
         "embedding_model": indexer.embedding_model,
         "embedding_backend": indexer.embedding_backend,
         "storage_backend": "sqlite_disk" if getattr(indexer, 'disk_store', None) else "numpy_memory",
-        "registry": reg.registry if reg else {},
-        "source_documents_count": len(getattr(indexer, 'source_documents', {})),
+        "registry": filtered_registry,
+        "source_documents_count": source_docs_count,
         "chunks": chunks_telemetry
     }
 

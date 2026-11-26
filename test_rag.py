@@ -6492,5 +6492,186 @@ class TestSessionIsolationInRoutingEndpoints(unittest.TestCase):
             self.assertEqual(res_b.json()["routing_decision"]["route"], "clarification")
 
 
+class TestIndexStatusAuthorizationFiltering(unittest.TestCase):
+    """
+    Test suite verifying Document-Level Access Control (RBAC/ABAC) and Lifecycle
+    authorization filtering on /index-status endpoint:
+    1. Ordinary users only see chunks and metadata for documents they are authorized to access.
+    2. Chunks and version registry entries for restricted/confidential documents are filtered out.
+    3. Soft-deleted documents and chunks are hidden from ordinary users.
+    4. Privilege escalation attempts via headers or query parameters are blocked.
+    5. Administrators have comprehensive visibility and can audit deleted docs and full text.
+    """
+
+    def setUp(self):
+        self._orig_env = {
+            "RAG_ALLOW_BUILTIN_TOKENS": os.environ.get("RAG_ALLOW_BUILTIN_TOKENS"),
+            "RAG_API_KEY": os.environ.get("RAG_API_KEY"),
+            "RAG_AUTH_MODE": os.environ.get("RAG_AUTH_MODE"),
+        }
+        os.environ["RAG_ALLOW_BUILTIN_TOKENS"] = "true"
+        os.environ.pop("RAG_API_KEY", None)
+        os.environ["RAG_AUTH_MODE"] = "development"
+
+        from main import app, indexer
+        from rag_core import TextChunker
+        from fastapi.testclient import TestClient
+
+        self.app = app
+        self.client = TestClient(app)
+        self.indexer = indexer
+        self.chunker = TextChunker(chunk_size=120, overlap=20)
+
+        self.user_headers = {"Authorization": "Bearer user-token"}
+        self.analyst_headers = {"Authorization": "Bearer analyst-token"}
+        self.admin_headers = {"Authorization": "Bearer admin-token"}
+
+        # Backup index state
+        self._backup_chunks = list(self.indexer.chunks)
+        self._backup_source_docs = {k: dict(v) for k, v in getattr(self.indexer, 'source_documents', {}).items()}
+        reg = getattr(self.indexer, 'version_registry', None)
+        self._backup_reg = {k: dict(v) for k, v in reg.registry.items()} if reg else {}
+
+        # Clear and stage test corpus
+        self.indexer.clear()
+        self.indexer.stage_and_commit_document(
+            doc_id="doc_status_public",
+            text="General public information open to all employees.",
+            title="Public Handbook",
+            chunker=self.chunker,
+            metadata={"classification": "public", "department": "general"}
+        )
+        self.indexer.stage_and_commit_document(
+            doc_id="doc_status_top_secret",
+            text="Top secret defense strategy restricted to top secret clearance.",
+            title="Strategic Defense",
+            chunker=self.chunker,
+            metadata={"clearance_level": "top_secret", "department": "defense"}
+        )
+        self.indexer.stage_and_commit_document(
+            doc_id="doc_status_finance",
+            text="Confidential quarterly earnings figures for finance analysts.",
+            title="Q3 Earnings",
+            chunker=self.chunker,
+            metadata={"allowed_roles": ["analyst"], "department": "finance", "clearance_level": "confidential"}
+        )
+        self.indexer.stage_and_commit_document(
+            doc_id="doc_status_deleted",
+            text="Decommissioned project document awaiting archiving.",
+            title="Decommissioned Project",
+            chunker=self.chunker,
+            metadata={"classification": "public"}
+        )
+        self.indexer.delete_document("doc_status_deleted")
+
+    def tearDown(self):
+        self.indexer.clear()
+        self.indexer.chunks = self._backup_chunks
+        if hasattr(self.indexer, 'source_documents'):
+            self.indexer.source_documents = self._backup_source_docs
+        reg = getattr(self.indexer, 'version_registry', None)
+        if reg:
+            reg.registry = self._backup_reg
+        if hasattr(self.indexer, 'bm25'):
+            self.indexer.bm25.index(self.indexer.chunks)
+
+        for k, v in self._orig_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_regular_user_only_sees_authorized_document_chunks_and_registry(self):
+        """Ordinary user only sees chunks and registry metadata for public authorized documents."""
+        res = self.client.get("/index-status", headers=self.user_headers)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+
+        # 1. Registry verification: restricted docs must NOT be leaked
+        registry = data.get("registry", {})
+        self.assertIn("doc_status_public", registry)
+        self.assertNotIn("doc_status_top_secret", registry)
+        self.assertNotIn("doc_status_finance", registry)
+        self.assertNotIn("doc_status_deleted", registry)
+
+        # 2. Chunks verification: only authorized chunks are returned
+        chunks = data.get("chunks", [])
+        chunk_doc_ids = {c.get("doc_id") for c in chunks}
+        self.assertIn("doc_status_public", chunk_doc_ids)
+        self.assertNotIn("doc_status_top_secret", chunk_doc_ids)
+        self.assertNotIn("doc_status_finance", chunk_doc_ids)
+        self.assertNotIn("doc_status_deleted", chunk_doc_ids)
+
+        # 3. Count verification: total_indexed_chunks matches authorized chunks count
+        self.assertEqual(data.get("total_indexed_chunks"), len(chunks))
+
+    def test_analyst_user_sees_role_authorized_documents(self):
+        """Analyst sees public and finance documents, but top_secret remains hidden."""
+        res = self.client.get("/index-status", headers=self.analyst_headers)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+
+        registry = data.get("registry", {})
+        self.assertIn("doc_status_public", registry)
+        self.assertIn("doc_status_finance", registry)
+        self.assertNotIn("doc_status_top_secret", registry)
+        self.assertNotIn("doc_status_deleted", registry)
+
+        chunks = data.get("chunks", [])
+        chunk_doc_ids = {c.get("doc_id") for c in chunks}
+        self.assertIn("doc_status_public", chunk_doc_ids)
+        self.assertIn("doc_status_finance", chunk_doc_ids)
+        self.assertNotIn("doc_status_top_secret", chunk_doc_ids)
+
+    def test_caller_privilege_escalation_attempt_is_blocked(self):
+        """Caller attempting to pass spoofed admin headers/query params cannot bypass filter."""
+        spoofed_headers = {
+            "Authorization": "Bearer user-token",
+            "X-User-Role": "admin,superuser",
+            "X-Clearance-Level": "top_secret"
+        }
+        res = self.client.get(
+            "/index-status?role=admin&clearance_level=top_secret",
+            headers=spoofed_headers
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+
+        # Enforced server-side principal claims: top_secret and finance docs remain filtered
+        registry = data.get("registry", {})
+        self.assertNotIn("doc_status_top_secret", registry)
+        self.assertNotIn("doc_status_finance", registry)
+
+        chunks = data.get("chunks", [])
+        chunk_doc_ids = {c.get("doc_id") for c in chunks}
+        self.assertNotIn("doc_status_top_secret", chunk_doc_ids)
+        self.assertNotIn("doc_status_finance", chunk_doc_ids)
+
+    def test_admin_sees_all_documents_and_can_audit_deleted_and_text(self):
+        """Admin has visibility across all active documents, deleted docs, and text if requested."""
+        # 1. Standard admin view
+        res = self.client.get("/index-status", headers=self.admin_headers)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        reg = data.get("registry", {})
+        self.assertIn("doc_status_public", reg)
+        self.assertIn("doc_status_top_secret", reg)
+        self.assertIn("doc_status_finance", reg)
+        # Soft-deleted document is excluded by default
+        self.assertNotIn("doc_status_deleted", reg)
+
+        # 2. Admin auditing deleted documents with include_deleted=true
+        res_del = self.client.get("/index-status?include_deleted=true", headers=self.admin_headers)
+        self.assertEqual(res_del.status_code, 200)
+        data_del = res_del.json()
+        self.assertIn("doc_status_deleted", data_del.get("registry", {}))
+
+        # 3. Admin auditing chunk text with include_text=true
+        res_text = self.client.get("/index-status?include_text=true", headers=self.admin_headers)
+        self.assertEqual(res_text.status_code, 200)
+        for c in res_text.json().get("chunks", []):
+            self.assertIn("text", c)
+
+
 if __name__ == "__main__":
     unittest.main()
