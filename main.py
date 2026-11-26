@@ -462,10 +462,13 @@ async def get_current_principal(
         # Check primary configured RAG_API_KEY
         if expected:
             if secrets.compare_digest(str(provided), str(expected)):
-                # If dedicated RAG_ADMIN_API_KEY is configured, primary key defaults to standard 'user'.
-                # Otherwise, in single-key mode, defaults to 'admin,user' unless overridden by RAG_SERVICE_ROLES.
-                default_roles = "user" if admin_key else "admin,user"
-                default_clearance = "internal" if admin_key else "top_secret"
+                # Principle of Least Privilege:
+                # Primary RAG_API_KEY strictly defaults to standard 'user' role and 'internal' clearance
+                # regardless of whether RAG_ADMIN_API_KEY is configured.
+                # Administrative authority requires an explicit configuration decision:
+                # either via RAG_ADMIN_API_KEY or explicit opt-in via RAG_SERVICE_ROLES containing 'admin'.
+                default_roles = "user"
+                default_clearance = "internal"
                 service_roles = [r.strip().lower() for r in os.environ.get("RAG_SERVICE_ROLES", default_roles).split(",") if r.strip()]
                 service_clearance = os.environ.get("RAG_SERVICE_CLEARANCE", default_clearance).strip().lower()
                 return AuthenticatedPrincipal(

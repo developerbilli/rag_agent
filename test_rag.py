@@ -4157,6 +4157,8 @@ class TestAPIAuthenticationAndRouteSeparation(unittest.TestCase):
         """Mutation endpoints like DELETE /documents/{doc_id} and POST /clear-index are blocked without credentials."""
         test_key = "mutation-test-key"
         os.environ["RAG_API_KEY"] = test_key
+        os.environ.pop("RAG_ADMIN_API_KEY", None)
+        os.environ.pop("RAG_SERVICE_ROLES", None)
 
         # Blocked without key: document deletion
         res_del = self.client.delete("/documents/doc_test_mutation")
@@ -4166,12 +4168,22 @@ class TestAPIAuthenticationAndRouteSeparation(unittest.TestCase):
         res_clear = self.client.post("/clear-index")
         self.assertEqual(res_clear.status_code, 401)
 
-        # Allowed with key
-        res_clear_auth = self.client.post(
+        # Standard primary key defaults to 'user' role: administrative mutation rejected with 403 Forbidden
+        res_clear_user = self.client.post(
             "/clear-index",
             headers={"X-API-Key": test_key}
         )
-        self.assertEqual(res_clear_auth.status_code, 200)
+        self.assertEqual(res_clear_user.status_code, 403)
+        self.assertIn("Administrative privileges required", res_clear_user.json()["detail"])
+
+        # With explicit administrative authority (RAG_ADMIN_API_KEY), clear index succeeds
+        admin_key = "admin-secret-mutation-key"
+        os.environ["RAG_ADMIN_API_KEY"] = admin_key
+        res_clear_admin = self.client.post(
+            "/clear-index",
+            headers={"X-API-Key": admin_key}
+        )
+        self.assertEqual(res_clear_admin.status_code, 200)
 
 
 class TestServerSideAuthorizationAndIdentityIntegrity(unittest.TestCase):
@@ -5317,17 +5329,24 @@ class TestBuiltInCredentialBypassPrevention(unittest.TestCase):
             self.assertIn("Built-in development credentials are disabled", res.json().get("detail", ""))
 
     def test_builtin_03_valid_configured_api_key_succeeds(self):
-        """The configured production RAG_API_KEY authenticates successfully with admin permissions."""
+        """The configured production RAG_API_KEY authenticates successfully with least privilege (user role)."""
         prod_key = "production-auth-key-valid-888"
         os.environ["RAG_API_KEY"] = prod_key
         os.environ.pop("RAG_ALLOW_BUILTIN_TOKENS", None)
+        os.environ.pop("RAG_SERVICE_ROLES", None)
 
         res = self.client.get("/documents", headers={"Authorization": f"Bearer {prod_key}"})
         self.assertEqual(res.status_code, 200)
 
-        # Confirm admin actions succeed with valid configured key
+        # Primary key defaults to standard 'user' role: administrative mutation is rejected with 403 Forbidden
         res_clear = self.client.post("/clear-index", headers={"Authorization": f"Bearer {prod_key}"})
-        self.assertEqual(res_clear.status_code, 200)
+        self.assertEqual(res_clear.status_code, 403)
+        self.assertIn("Administrative privileges required", res_clear.json().get("detail", ""))
+
+        # Explicit admin authority via RAG_SERVICE_ROLES succeeds
+        os.environ["RAG_SERVICE_ROLES"] = "admin,user"
+        res_clear_admin = self.client.post("/clear-index", headers={"Authorization": f"Bearer {prod_key}"})
+        self.assertEqual(res_clear_admin.status_code, 200)
 
     def test_builtin_04_server_registered_idp_credential_succeeds(self):
         """Credentials dynamically issued/registered in the server-side registry are accepted in production."""
@@ -6818,6 +6837,29 @@ class TestArchitecturalConcerns(unittest.TestCase):
         # 2. Admin key can perform administrative operations
         res_clear_admin = self.client.post("/clear-index", headers={"Authorization": f"Bearer {admin_secret}"})
         self.assertEqual(res_clear_admin.status_code, 200)
+
+    def test_arch_03b_primary_key_defaults_to_user_without_admin_key(self):
+        """Primary RAG_API_KEY defaults to 'user' role and 'internal' clearance even when RAG_ADMIN_API_KEY is unset."""
+        service_key = "stand-alone-service-key-777"
+        os.environ["RAG_AUTH_MODE"] = "production"
+        os.environ["RAG_API_KEY"] = service_key
+        os.environ.pop("RAG_ADMIN_API_KEY", None)
+        os.environ.pop("RAG_SERVICE_ROLES", None)
+        os.environ.pop("RAG_SERVICE_CLEARANCE", None)
+
+        # 1. Primary key authenticates and can read documents
+        res_docs = self.client.get("/documents", headers={"Authorization": f"Bearer {service_key}"})
+        self.assertEqual(res_docs.status_code, 200)
+
+        # 2. Destructive admin operation is blocked by default (HTTP 403 Forbidden)
+        res_clear = self.client.post("/clear-index", headers={"Authorization": f"Bearer {service_key}"})
+        self.assertEqual(res_clear.status_code, 403)
+        self.assertIn("Administrative privileges required", res_clear.json()["detail"])
+
+        # 3. Explicit opt-in via RAG_SERVICE_ROLES grants administrative authority
+        os.environ["RAG_SERVICE_ROLES"] = "admin,user"
+        res_clear_opt_in = self.client.post("/clear-index", headers={"Authorization": f"Bearer {service_key}"})
+        self.assertEqual(res_clear_opt_in.status_code, 200)
 
     def test_arch_04_operational_endpoints_require_auth_when_metrics_protection_enabled(self):
         """When RAG_PROTECT_OPERATIONAL_METRICS=true, /observability and /models-status require auth."""

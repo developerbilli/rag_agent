@@ -464,7 +464,10 @@ Merely omitting raw document text from operational diagnostic endpoints is insuf
 - Streaming bodies exceeding `RAG_MAX_REQUEST_BODY_SIZE` are aborted with HTTP `413 Payload Too Large` before multipart buffers spool to disk or memory.
 
 ### 4. API Key Role Separation & Least-Privilege Defaults
-- Support for dedicated `RAG_ADMIN_API_KEY`: when configured, grants administrative authority (`admin`, `superuser`, `data_admin`), while the shared `RAG_API_KEY` defaults to standard `user` role with `internal` clearance.
+- **Least-Privilege by Default**: Primary API key (`RAG_API_KEY`) strictly defaults to standard `user` role and `internal` clearance, regardless of whether a separate admin key is configured. Destructive administrative operations (e.g., `/clear-index`, `/documents/{doc_id}` deletion) are rejected by default with HTTP 403 Forbidden.
+- **Explicit Administrative Authority**: Administrative authority requires an explicit configuration decision:
+  - Configure `RAG_ADMIN_API_KEY` for dedicated administrative access (`admin`, `superuser`, `data_admin`, `sysadmin` with `top_secret` clearance).
+  - Or explicitly opt-in the primary key via `RAG_SERVICE_ROLES=admin,user` (and `RAG_SERVICE_CLEARANCE=top_secret`).
 - Operators can explicitly customize `RAG_SERVICE_ROLES` and `RAG_SERVICE_CLEARANCE` without granting broad administrative powers by default.
 
 ### 5. Protected Operational Endpoints in Hosted Deployments
