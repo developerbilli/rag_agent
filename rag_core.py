@@ -1023,8 +1023,17 @@ class MetadataFilterEngine:
             "public"
         ).lower()
 
-        # If document is explicitly public with no restrictions, allow access
-        has_restrictions = bool(allowed_roles or allowed_users or chunk_dept_restricted or (classification != "public"))
+        # Document restriction determination:
+        # Access-Control Allowlist Policy:
+        # 1. Missing allowlist (None): unrestricted by that rule.
+        # 2. Non-empty allowlist: only listed identities or roles are permitted.
+        # 3. Empty allowlist (e.g., []): explicitly configured to allow nobody (deny everyone except admin).
+        has_restrictions = bool(
+            (allowed_roles is not None)
+            or (allowed_users is not None)
+            or chunk_dept_restricted
+            or (classification != "public")
+        )
         if not has_restrictions:
             return True
 
@@ -1049,14 +1058,22 @@ class MetadataFilterEngine:
 
         # 1. Allowed Users Check (DAC Allowlist)
         if allowed_users is not None:
-            user_list = [str(u).strip() for u in (allowed_users if isinstance(allowed_users, list) else [allowed_users])]
-            if user_id not in user_list:
+            if isinstance(allowed_users, (list, tuple, set)):
+                user_list = [str(u).strip() for u in allowed_users if str(u).strip()]
+            else:
+                user_list = [str(allowed_users).strip()] if str(allowed_users).strip() else []
+            # Empty allowlist explicitly denies everyone; non-empty allowlist requires membership
+            if not user_list or user_id not in user_list:
                 return False
 
-        # 2. Allowed Roles Check (RBAC)
+        # 2. Allowed Roles Check (RBAC Allowlist)
         if allowed_roles is not None:
-            role_list = [str(r).lower() for r in (allowed_roles if isinstance(allowed_roles, list) else [allowed_roles])]
-            if not any(ur in role_list for ur in user_roles):
+            if isinstance(allowed_roles, (list, tuple, set)):
+                role_list = [str(r).lower().strip() for r in allowed_roles if str(r).strip()]
+            else:
+                role_list = [str(allowed_roles).lower().strip()] if str(allowed_roles).strip() else []
+            # Empty allowlist explicitly denies everyone; non-empty allowlist requires matching role
+            if not role_list or not any(ur in role_list for ur in user_roles):
                 return False
 
         # 3. Department Isolation (ABAC)

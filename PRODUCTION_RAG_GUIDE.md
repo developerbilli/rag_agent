@@ -449,6 +449,20 @@ Merely omitting raw document text from operational diagnostic endpoints is insuf
 
 ---
 
+## Production Security: Access-Control Allowlist Policy (Empty Allowlists Deny Everyone)
+
+When enforcing document-level RBAC/ABAC access control (`MetadataFilterEngine.evaluate_access_control`), explicit policies govern how allowlists (`allowed_roles`, `allowed_users`) are interpreted:
+
+1. **Missing Allowlist (`None` or omitted)**:
+   - The document is unrestricted by that rule (e.g., if `allowed_roles` is omitted and clearance is `public`, it is accessible to callers meeting other criteria).
+2. **Non-Empty Allowlist (e.g., `["finance", "executive"]`)**:
+   - Only callers presenting matching identities (`user_id`) or validated roles (`roles`) are permitted.
+3. **Empty Allowlist (e.g., `[]`)**:
+   - Explicitly configured to allow **nobody**. An empty allowlist treats the document as restricted and immediately denies access to all standard users, preventing accidental exposure of sensitive documents configured with empty allowlists.
+   - Authorized administrators retain oversight and audit access to prevent ownerless lockouts.
+
+---
+
 ## Production Security: Architectural Hardening & Concurrency Safety
 
 ### 1. Request-Local Chunker Instances (Concurrency Race Prevention)

@@ -4308,6 +4308,65 @@ class TestServerSideAuthorizationAndIdentityIntegrity(unittest.TestCase):
         self.assertFalse(MetadataFilterEngine.evaluate_access_control(restricted_chunk, user_p))
         self.assertTrue(MetadataFilterEngine.evaluate_access_control(restricted_chunk, admin_p))
 
+    def test_sec_05b_empty_access_control_allowlists_deny_everyone(self):
+        """
+        Tests access-control allowlist policy:
+        1. Missing allowlist (None): unrestricted by that rule.
+        2. Non-empty allowlist: only listed identities or roles are permitted.
+        3. Empty allowlist ([]): explicitly configured to allow NOBODY (deny everyone, except admin).
+        """
+        user_p = AuthenticatedPrincipal(principal_id="alice", roles=["user"], clearance_level="public")
+        engineer_p = AuthenticatedPrincipal(principal_id="bob", roles=["engineer", "developer"], clearance_level="public")
+        admin_p = AuthenticatedPrincipal(principal_id="root", roles=["admin"], clearance_level="top_secret")
+
+        # 1. Empty allowed_roles list with public classification: DENY everyone except admin
+        empty_roles_chunk = {
+            "chunk_id": "c_empty_roles",
+            "metadata": {
+                "allowed_roles": [],
+                "classification": "public"
+            }
+        }
+        self.assertFalse(MetadataFilterEngine.evaluate_access_control(empty_roles_chunk, None), "Unauthenticated must be denied")
+        self.assertFalse(MetadataFilterEngine.evaluate_access_control(empty_roles_chunk, user_p), "User must be denied on empty allowed_roles")
+        self.assertFalse(MetadataFilterEngine.evaluate_access_control(empty_roles_chunk, engineer_p), "Engineer must be denied on empty allowed_roles")
+        self.assertTrue(MetadataFilterEngine.evaluate_access_control(empty_roles_chunk, admin_p), "Admin must be allowed oversight")
+
+        # 2. Empty allowed_users list with public classification: DENY everyone except admin
+        empty_users_chunk = {
+            "chunk_id": "c_empty_users",
+            "metadata": {
+                "allowed_users": [],
+                "classification": "public"
+            }
+        }
+        self.assertFalse(MetadataFilterEngine.evaluate_access_control(empty_users_chunk, None), "Unauthenticated must be denied")
+        self.assertFalse(MetadataFilterEngine.evaluate_access_control(empty_users_chunk, user_p), "Alice must be denied on empty allowed_users")
+        self.assertFalse(MetadataFilterEngine.evaluate_access_control(empty_users_chunk, engineer_p), "Bob must be denied on empty allowed_users")
+        self.assertTrue(MetadataFilterEngine.evaluate_access_control(empty_users_chunk, admin_p), "Admin must be allowed oversight")
+
+        # 3. Missing allowlists (None / omitted): UNRESTRICTED by those rules
+        unrestricted_chunk = {
+            "chunk_id": "c_unrestricted",
+            "metadata": {
+                "classification": "public"
+            }
+        }
+        self.assertTrue(MetadataFilterEngine.evaluate_access_control(unrestricted_chunk, None), "Unauthenticated allowed on public doc")
+        self.assertTrue(MetadataFilterEngine.evaluate_access_control(unrestricted_chunk, user_p), "User allowed on public doc")
+
+        # 4. Non-empty allowlist: only listed identities allowed
+        non_empty_chunk = {
+            "chunk_id": "c_non_empty",
+            "metadata": {
+                "allowed_roles": ["engineer"],
+                "classification": "public"
+            }
+        }
+        self.assertFalse(MetadataFilterEngine.evaluate_access_control(non_empty_chunk, user_p), "User denied without engineer role")
+        self.assertTrue(MetadataFilterEngine.evaluate_access_control(non_empty_chunk, engineer_p), "Engineer allowed")
+        self.assertTrue(MetadataFilterEngine.evaluate_access_control(non_empty_chunk, admin_p), "Admin allowed")
+
     def test_sec_06_build_authoritative_user_context_strips_privilege_escalation(self):
         """Unit test confirming build_authoritative_user_context strictly replaces privilege claims."""
         from main import build_authoritative_user_context

@@ -233,6 +233,8 @@ The pipeline provides configurable authentication modes via `RAG_AUTH_MODE=devel
   - All conversation memory lookups across generation (`/generate-rag`, `/generate-guarded`), query classification (`/route-query`), and auto-routing (`/retrieve`) strictly enforce internal principal-scoped session IDs (`<principal_id>:<session_id>`), preventing cross-user history exposure or routing poisoning.
 - **Document-Level Authorization on Index Telemetry (`/index-status`)**:
   - Chunks and version registry entries returned by `/index-status` are strictly filtered by the authenticated principal's access context (roles, clearance, department, and lifecycle state), preventing metadata leakage (titles, classifications, department names, document IDs) of unauthorized documents to ordinary users. Full text inspection requires administrative privileges (`include_text=true`).
+- **Access-Control Allowlist Policy (Fail-Closed Allowlists)**:
+  - `MetadataFilterEngine.evaluate_access_control()` enforces strict semantics for `allowed_roles` and `allowed_users`: missing allowlists are unrestricted by that rule, non-empty allowlists require matching claims, and empty allowlists (`[]`) explicitly deny everyone (except administrators), eliminating fail-open exposure of documents with empty allowlists.
 - **Architectural Concurrency & Operational Hardening**:
   - **Request-Local Chunkers**: `/ingest` and `/ingest-folder` instantiate request-scoped chunkers, eliminating state mutation races across concurrent requests.
   - **Bounded Upload Memory**: File uploads stream chunk-by-chunk to disk temporary files, eliminating peak RAM explosion from joined byte buffers.
