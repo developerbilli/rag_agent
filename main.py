@@ -14,7 +14,7 @@ import secrets
 import logging
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Header, Query, Depends, Security, APIRouter, status
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -52,6 +52,79 @@ app = FastAPI(
     description="Production-grade offline RAG pipeline combining BM25 keyword retrieval and dense-vector retrieval with Reciprocal Rank Fusion (RRF), cross-encoder reranking, transactional rollback, propositional claim verification, and multi-turn memory.",
     version="2.0.0"
 )
+
+# ==============================================================================
+# File Upload & DoS Protection Safeguards
+# ==============================================================================
+def get_upload_limits() -> Dict[str, int]:
+    """
+    Retrieve current upload and DoS limits from environment variables with safe enterprise defaults:
+    - RAG_MAX_UPLOAD_SIZE: max size per individual file (default: 25 MB)
+    - RAG_MAX_UPLOAD_FILE_COUNT: max files per upload request (default: 20)
+    - RAG_MAX_REQUEST_UPLOAD_SIZE: max cumulative upload bytes per request (default: 50 MB)
+    - RAG_MAX_REQUEST_BODY_SIZE: max HTTP request body size (default: 55 MB)
+    - RAG_UPLOAD_CHUNK_SIZE: chunk size for bounded streaming reads (default: 64 KB)
+    """
+    try:
+        max_file_size = int(os.environ.get("RAG_MAX_UPLOAD_SIZE", str(25 * 1024 * 1024)))
+    except ValueError:
+        max_file_size = 25 * 1024 * 1024
+
+    try:
+        max_file_count = int(os.environ.get("RAG_MAX_UPLOAD_FILE_COUNT", "20"))
+    except ValueError:
+        max_file_count = 20
+
+    try:
+        max_request_size = int(os.environ.get("RAG_MAX_REQUEST_UPLOAD_SIZE", str(50 * 1024 * 1024)))
+    except ValueError:
+        max_request_size = 50 * 1024 * 1024
+
+    try:
+        max_body_size = int(os.environ.get("RAG_MAX_REQUEST_BODY_SIZE", str(55 * 1024 * 1024)))
+    except ValueError:
+        max_body_size = 55 * 1024 * 1024
+
+    try:
+        chunk_size = int(os.environ.get("RAG_UPLOAD_CHUNK_SIZE", str(64 * 1024)))
+    except ValueError:
+        chunk_size = 64 * 1024
+
+    return {
+        "max_file_size": max_file_size,
+        "max_file_count": max_file_count,
+        "max_request_size": max_request_size,
+        "max_body_size": max_body_size,
+        "chunk_size": chunk_size,
+    }
+
+MAX_UPLOAD_SIZE = 25 * 1024 * 1024
+MAX_UPLOAD_FILE_COUNT = 20
+MAX_REQUEST_UPLOAD_SIZE = 50 * 1024 * 1024
+MAX_REQUEST_BODY_SIZE = 55 * 1024 * 1024
+UPLOAD_CHUNK_SIZE = 64 * 1024
+
+
+@app.middleware("http")
+async def enforce_request_body_size_limit(request: Request, call_next):
+    """
+    Early rejection of requests that exceed server request-body limits based on Content-Length header.
+    Protects reverse proxy and application memory before request body streaming begins.
+    """
+    content_length_str = request.headers.get("content-length")
+    if content_length_str:
+        try:
+            content_length = int(content_length_str)
+            limits = get_upload_limits()
+            max_body = limits["max_body_size"]
+            if content_length > max_body:
+                return JSONResponse(
+                    status_code=getattr(status, "HTTP_413_CONTENT_TOO_LARGE", 413),
+                    content={"detail": f"Request entity too large: Content-Length ({content_length} bytes) exceeds limit of {max_body} bytes."}
+                )
+        except ValueError:
+            pass
+    return await call_next(request)
 
 # Authentication Schemes & Server-Side Identity Layer
 api_key_header_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -287,7 +360,6 @@ class QueryRequest(BaseModel):
     small_model_mode: Optional[bool] = False
     is_untrusted_source: Optional[bool] = False
 
-MAX_UPLOAD_SIZE = 25 * 1024 * 1024  # 25 MB enterprise upload guard (Item 12)
 
 class EvalItem(BaseModel):
     query: str
@@ -450,27 +522,130 @@ def ingest_documents(req: IngestRequest):
     }
 
 
+async def read_bounded_upload_file(
+    file: UploadFile,
+    max_file_size: int,
+    chunk_size: int = 64 * 1024,
+    remaining_request_budget: Optional[int] = None
+) -> Tuple[Optional[bytes], int, Optional[str]]:
+    """
+    Streams and reads an UploadFile in bounded chunks without buffering full content into memory.
+    Aborts immediately as soon as max_file_size or remaining_request_budget is exceeded.
+    Returns:
+        (content_bytes, bytes_read, error_message)
+    If a limit is exceeded, content_bytes is None to immediately free memory, and bytes_read
+    reflects the amount read prior to early abort.
+    """
+    chunks: List[bytes] = []
+    total_bytes_read = 0
+
+    try:
+        while True:
+            chunk = await file.read(chunk_size)
+            if not chunk:
+                break
+
+            chunk_len = len(chunk)
+            total_bytes_read += chunk_len
+
+            # 1. Enforce individual file size limit
+            if total_bytes_read > max_file_size:
+                chunks.clear()  # Free memory immediately
+                try:
+                    await file.close()
+                except Exception:
+                    pass
+                return (
+                    None,
+                    total_bytes_read,
+                    f"File exceeds maximum allowed upload limit of {max_file_size} bytes (aborted early after reading {total_bytes_read} bytes)"
+                )
+
+            # 2. Enforce cumulative request upload budget
+            if remaining_request_budget is not None and total_bytes_read > remaining_request_budget:
+                chunks.clear()  # Free memory immediately
+                try:
+                    await file.close()
+                except Exception:
+                    pass
+                return (
+                    None,
+                    total_bytes_read,
+                    f"Cumulative request upload size exceeds maximum allowed limit of {remaining_request_budget} bytes (aborted early after reading {total_bytes_read} bytes)"
+                )
+
+            chunks.append(chunk)
+
+        try:
+            await file.close()
+        except Exception:
+            pass
+
+        return b"".join(chunks), total_bytes_read, None
+    except Exception as e:
+        chunks.clear()
+        try:
+            await file.close()
+        except Exception:
+            pass
+        return None, total_bytes_read, f"Streaming read error: {str(e)}"
+
+
 @protected_router.post("/upload")
 async def upload_files(files: List[UploadFile] = File(...)):
     """
     Phase 2: Uploads one or more files (.pdf, .txt, .md, and code formats).
+    Streams uploads in bounded chunks to prevent denial-of-service (DoS) memory exhaustion.
+    Enforces request-level file count and cumulative size limits.
     Routes every document through canonical lifecycle management (stage_and_commit_document).
     Guarantees revision tracking, idempotent re-upload handling, and chunk ID uniqueness.
     """
     if not files:
-        raise HTTPException(status_code=400, detail="No files provided.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No files provided.")
+
+    limits = get_upload_limits()
+    max_file_size = limits["max_file_size"]
+    max_file_count = limits["max_file_count"]
+    max_request_size = limits["max_request_size"]
+    chunk_size = limits["chunk_size"]
+
+    # 1. Request-level file-count limit
+    if len(files) > max_file_count:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Exceeded maximum file count limit: received {len(files)} files, maximum allowed is {max_file_count} files per request."
+        )
 
     processed_count = 0
     total_chunks_created = 0
+    cumulative_bytes = 0
     errors = []
     results = []
 
     for file in files:
         filename = os.path.basename(file.filename or "uploaded_file")
         try:
-            content = await file.read()
-            if len(content) > MAX_UPLOAD_SIZE:
-                errors.append(f"'{filename}': File exceeds maximum allowed upload limit of 25MB ({len(content)} bytes)")
+            # Check if cumulative request budget is already exhausted
+            remaining_budget = max_request_size - cumulative_bytes
+            if remaining_budget <= 0:
+                err_msg = f"'{filename}': Request cumulative upload size limit of {max_request_size} bytes reached; skipping remaining files."
+                errors.append(err_msg)
+                break
+
+            content, bytes_read, read_err = await read_bounded_upload_file(
+                file=file,
+                max_file_size=max_file_size,
+                chunk_size=chunk_size,
+                remaining_request_budget=remaining_budget
+            )
+            cumulative_bytes += bytes_read
+
+            if read_err:
+                errors.append(f"'{filename}': {read_err}")
+                continue
+
+            if not content:
+                errors.append(f"'{filename}': File is empty or contains no readable content")
                 continue
 
             doc = DocumentLoader.load_bytes(filename, content)
@@ -501,7 +676,7 @@ async def upload_files(files: List[UploadFile] = File(...)):
 
     if processed_count == 0:
         detail_msg = "; ".join(errors) if errors else "No readable text chunks could be extracted from uploaded files."
-        raise HTTPException(status_code=400, detail=detail_msg)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail_msg)
 
     return {
         "status": "success",

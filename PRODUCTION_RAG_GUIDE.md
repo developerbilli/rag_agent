@@ -266,5 +266,70 @@ flowchart TD
 
 ---
 
+## Production Security: Reverse Proxy & Gateway Request-Body Limits (DoS Mitigation)
+
+In enterprise deployments, file uploads must be defended at multiple infrastructure layers to prevent denial-of-service (DoS) memory exhaustion:
+
+### 1. Reverse Proxy & API Gateway Layer
+Reverse proxies (e.g., Nginx, Caddy, AWS ALB, Cloudflare) must enforce strict request-body limits before traffic reaches the Python application:
+
+#### Nginx Configuration (`/etc/nginx/conf.d/rag_api.conf`):
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name rag.internal.company.com;
+
+    # Enforce request body and buffer limits to prevent memory exhaustion
+    client_max_body_size 55M;          # Slightly above 50MB cumulative upload limit to allow multipart framing
+    client_body_buffer_size 128k;       # Buffer small bodies in memory; spill larger streams to temporary disk
+    client_body_timeout 30s;            # Prevent Slowloris / slow-body upload DoS attacks
+    client_header_timeout 15s;
+
+    location /upload {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Spool large uploads to temporary disk buffer before forwarding
+        proxy_request_buffering on;
+        proxy_read_timeout 120s;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+#### Caddy Configuration (`Caddyfile`):
+```caddy
+rag.internal.company.com {
+    request_body {
+        max_size 55MB
+    }
+    reverse_proxy localhost:8000 {
+        header_up Host {host}
+        header_up X-Real-IP {remote}
+    }
+}
+```
+
+### 2. Application Layer Streaming & Resource Guards (`main.py`)
+- **Bounded Chunk Streaming**: Files are read in bounded 64 KB chunks (`read_bounded_upload_file`) rather than loading entire payloads into memory with unbounded `await file.read()`.
+- **Early Abort**: If an individual file exceeds `RAG_MAX_UPLOAD_SIZE` (default 25 MB), streaming halts immediately, the file buffer is cleared, and file descriptors are closed without consuming additional memory.
+- **Request File-Count Limits**: Requests containing more than `RAG_MAX_UPLOAD_FILE_COUNT` (default 20 files) are rejected immediately upfront with HTTP 400 Bad Request before reading any file content.
+- **Cumulative Request Budget**: The request tracks cumulative bytes streamed across all files; if cumulative bytes exceed `RAG_MAX_REQUEST_UPLOAD_SIZE` (default 50 MB), subsequent files and chunks are immediately rejected.
+- **Content-Length Inspection Middleware**: Incoming requests with `Content-Length` exceeding `RAG_MAX_REQUEST_BODY_SIZE` (default 55 MB) are rejected with HTTP 413 Payload Too Large before request body parsing begins.
+
+---
+
 ## Conclusion
 Our project architecture provides concrete, production-grade implementations for each of these 10 areas, balancing lightweight local edge constraints (running smoothly on Apple Silicon with 16 GB RAM) with enterprise-level robustness.

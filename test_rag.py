@@ -5351,5 +5351,184 @@ class TestBuiltInCredentialBypassPrevention(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
 
 
+class TestUploadDoSProtectionAndStreamingLimits(unittest.TestCase):
+    """
+    Test suite verifying streaming upload DoS protections:
+    - Bounded chunk streaming that halts immediately when limits are exceeded without buffering full payload
+    - Enforcement of request-level file count limit (RAG_MAX_UPLOAD_FILE_COUNT)
+    - Enforcement of cumulative request size budget (RAG_MAX_REQUEST_UPLOAD_SIZE)
+    - Early rejection of oversized request bodies via Content-Length middleware (RAG_MAX_REQUEST_BODY_SIZE)
+    - Verified resource release and early stream closure
+    """
+
+    def setUp(self):
+        self.env_backup = {
+            "RAG_MAX_UPLOAD_SIZE": os.environ.get("RAG_MAX_UPLOAD_SIZE"),
+            "RAG_MAX_UPLOAD_FILE_COUNT": os.environ.get("RAG_MAX_UPLOAD_FILE_COUNT"),
+            "RAG_MAX_REQUEST_UPLOAD_SIZE": os.environ.get("RAG_MAX_REQUEST_UPLOAD_SIZE"),
+            "RAG_MAX_REQUEST_BODY_SIZE": os.environ.get("RAG_MAX_REQUEST_BODY_SIZE"),
+            "RAG_UPLOAD_CHUNK_SIZE": os.environ.get("RAG_UPLOAD_CHUNK_SIZE"),
+            "RAG_API_KEY": os.environ.get("RAG_API_KEY"),
+            "RAG_ALLOW_BUILTIN_TOKENS": os.environ.get("RAG_ALLOW_BUILTIN_TOKENS"),
+        }
+        os.environ["RAG_ALLOW_BUILTIN_TOKENS"] = "true"
+        os.environ.pop("RAG_API_KEY", None)
+
+        from fastapi.testclient import TestClient
+        from main import app, read_bounded_upload_file, get_upload_limits, indexer, chunker
+        self.app = app
+        self.client = TestClient(app)
+        self.read_bounded_upload_file = read_bounded_upload_file
+        self.get_upload_limits = get_upload_limits
+        self.indexer = indexer
+        self.chunker = chunker
+        self.admin_headers = {"Authorization": "Bearer admin-token"}
+
+    def tearDown(self):
+        for k, v in self.env_backup.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+
+    def test_upload_01_early_abort_does_not_consume_remaining_stream(self):
+        """Bounded reader stops reading as soon as limit is exceeded, never buffering remainder in memory."""
+        import asyncio
+
+        class MockStreamFile:
+            def __init__(self, total_size: int, chunk_size: int):
+                self.total_size = total_size
+                self.chunk_size = chunk_size
+                self.chunks_read = 0
+                self.bytes_read = 0
+                self.closed = False
+
+            async def read(self, size: int = -1) -> bytes:
+                if self.bytes_read >= self.total_size:
+                    return b""
+                read_sz = min(size if size > 0 else self.chunk_size, self.total_size - self.bytes_read)
+                self.bytes_read += read_sz
+                self.chunks_read += 1
+                return b"Z" * read_sz
+
+            async def close(self):
+                self.closed = True
+
+        async def run_check():
+            # Total simulated upload is 10 MB, limit is 128 KB, chunk size is 64 KB
+            mock = MockStreamFile(total_size=10 * 1024 * 1024, chunk_size=64 * 1024)
+            content, total_read, err = await self.read_bounded_upload_file(
+                file=mock,
+                max_file_size=128 * 1024,
+                chunk_size=64 * 1024
+            )
+            return mock, content, total_read, err
+
+        mock_file, content, total_read, error_msg = asyncio.run(run_check())
+
+        # 1. Memory must be freed (content is None)
+        self.assertIsNone(content, "Oversized content buffer must be cleared and returned as None")
+        # 2. Must register early abort error message
+        self.assertIsNotNone(error_msg)
+        self.assertIn("File exceeds maximum allowed upload limit", error_msg)
+        # 3. Reading must have halted immediately after exceeding 128 KB (chunk 3 = 192 KB)
+        self.assertEqual(mock_file.chunks_read, 3, "Must abort at chunk 3 without reading remaining 150+ chunks")
+        self.assertLess(mock_file.bytes_read, 300 * 1024, "Must not consume 10MB into memory")
+        # 4. Underlying file descriptor must be closed
+        self.assertTrue(mock_file.closed, "File must be closed on early abort")
+
+    def test_upload_02_single_file_exceeding_limit_http_endpoint_rejects(self):
+        """HTTP POST /upload rejects single file exceeding RAG_MAX_UPLOAD_SIZE with 400 Bad Request."""
+        os.environ["RAG_MAX_UPLOAD_SIZE"] = "500"  # 500 bytes limit
+        os.environ["RAG_UPLOAD_CHUNK_SIZE"] = "100"
+
+        oversized_payload = b"Large payload content that exceeds the 500 byte limit. " * 20  # ~1100 bytes
+        files = [("files", ("large_doc.txt", oversized_payload, "text/plain"))]
+
+        res = self.client.post("/upload", files=files, headers=self.admin_headers)
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("exceeds maximum allowed upload limit", res.json()["detail"])
+
+    def test_upload_03_file_count_limit_enforced_before_reading(self):
+        """HTTP POST /upload rejects requests containing more files than RAG_MAX_UPLOAD_FILE_COUNT."""
+        os.environ["RAG_MAX_UPLOAD_FILE_COUNT"] = "3"
+
+        # Prepare 4 files (exceeding limit of 3)
+        files = [
+            ("files", (f"file_{i}.txt", f"Sample text content for file {i}.".encode(), "text/plain"))
+            for i in range(4)
+        ]
+
+        res = self.client.post("/upload", files=files, headers=self.admin_headers)
+        self.assertEqual(res.status_code, 400)
+        detail = res.json()["detail"]
+        self.assertIn("Exceeded maximum file count limit", detail)
+        self.assertIn("received 4 files, maximum allowed is 3 files", detail)
+
+    def test_upload_04_cumulative_request_size_limit_enforced(self):
+        """Cumulative upload limit halts reading across multiple files once total exceeds budget."""
+        os.environ["RAG_MAX_UPLOAD_SIZE"] = "2000"         # Individual limit 2000 bytes
+        os.environ["RAG_MAX_REQUEST_UPLOAD_SIZE"] = "1200"  # Cumulative limit 1200 bytes
+        os.environ["RAG_UPLOAD_CHUNK_SIZE"] = "100"
+
+        file1_content = b"File 1 content valid: " + (b"A" * 700)   # ~722 bytes (<= 2000)
+        file2_content = b"File 2 content valid: " + (b"B" * 700)   # ~722 bytes (<= 2000, but sum ~1444 > 1200)
+
+        files = [
+            ("files", ("doc1.txt", file1_content, "text/plain")),
+            ("files", ("doc2.txt", file2_content, "text/plain")),
+        ]
+
+        res = self.client.post("/upload", files=files, headers=self.admin_headers)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        # File 1 processed, File 2 halted early due to cumulative budget exhaustion
+        self.assertEqual(data["files_processed"], 1)
+        self.assertIsNotNone(data["warnings"])
+        self.assertTrue(
+            any("cumulative request upload size" in w.lower() for w in data["warnings"]),
+            f"Expected cumulative upload warning, got: {data['warnings']}"
+        )
+
+    def test_upload_05_request_body_size_middleware_rejects_oversized_content_length(self):
+        """Middleware rejects requests exceeding RAG_MAX_REQUEST_BODY_SIZE with HTTP 413 Payload Too Large."""
+        os.environ["RAG_MAX_REQUEST_BODY_SIZE"] = "1024"  # 1 KB limit
+
+        headers = {
+            "Authorization": "Bearer admin-token",
+            "Content-Length": "2048",  # Advertises 2 KB
+        }
+
+        res = self.client.post("/upload", headers=headers, content=b"x" * 2048)
+        self.assertEqual(res.status_code, 413)
+        self.assertIn("Request entity too large", res.json()["detail"])
+        self.assertIn("Content-Length (2048 bytes) exceeds limit of 1024 bytes", res.json()["detail"])
+
+    def test_upload_06_valid_streaming_uploads_succeed_and_index(self):
+        """Legitimate file uploads stream cleanly, commit to index, and become searchable."""
+        os.environ["RAG_MAX_UPLOAD_SIZE"] = "50000"
+        os.environ["RAG_MAX_REQUEST_UPLOAD_SIZE"] = "100000"
+        os.environ["RAG_UPLOAD_CHUNK_SIZE"] = "512"
+
+        content1 = b"Vector embeddings and similarity search power modern retrieval augmented generation."
+        content2 = b"Reciprocal rank fusion combines rank positions across dense and lexical algorithms."
+
+        files = [
+            ("files", ("valid_doc_1.txt", content1, "text/plain")),
+            ("files", ("valid_doc_2.md", content2, "text/markdown")),
+        ]
+
+        res = self.client.post("/upload", files=files, headers=self.admin_headers)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["files_processed"], 2)
+        self.assertGreater(data["chunks_created"], 0)
+
+        # Confirm documents are in index
+        search_res = self.indexer.search("Vector embeddings", top_k=2)
+        self.assertGreater(len(search_res), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

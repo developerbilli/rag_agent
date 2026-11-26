@@ -186,3 +186,23 @@ If neither Ollama nor a cloud key is present, TinyRAG automatically uses its zer
 | `/sessions` | `GET` | Phase 5: List all active conversation sessions and turn counts |
 | `/sessions/{session_id}` | `GET` | Phase 5: Inspect full conversation dialogue history for a session |
 | `/sessions/{session_id}` | `DELETE` | Phase 5: Clear history buffer for a specific session |
+
+---
+
+## 🛡️ Upload Security & DoS Safeguards
+
+The file upload endpoint (`POST /upload`) enforces defense-in-depth protections against memory exhaustion and Denial-of-Service (DoS) attacks:
+
+- **Bounded Streaming**: Incoming files are read in bounded 64 KB chunks, aborting early if limits are reached and freeing memory without reading full payloads.
+- **Request-Level File Count**: Blocks requests with excessive files upfront before reading content.
+- **Cumulative Request Budget**: Limits total upload volume across all files in a single request.
+- **Content-Length Middleware**: Rejects oversized requests with HTTP 413 before request parsing.
+
+### Configurable Environment Variables:
+| Variable | Default | Description |
+|---|---|---|
+| `RAG_MAX_UPLOAD_SIZE` | `26214400` (25 MB) | Maximum permitted size for any individual uploaded file |
+| `RAG_MAX_UPLOAD_FILE_COUNT` | `20` | Maximum number of files permitted in a single upload request |
+| `RAG_MAX_REQUEST_UPLOAD_SIZE` | `52428800` (50 MB) | Maximum cumulative uploaded file size per request |
+| `RAG_MAX_REQUEST_BODY_SIZE` | `57671680` (55 MB) | Maximum HTTP request body limit (Content-Length check) |
+| `RAG_UPLOAD_CHUNK_SIZE` | `65536` (64 KB) | Streaming chunk size for bounded asynchronous file reading |
