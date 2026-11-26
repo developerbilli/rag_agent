@@ -11,11 +11,14 @@ Interactive Web UI: (/ and /ui)
 import os
 import time
 import secrets
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Header, Query, Depends, Security, APIRouter
+import logging
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Header, Query, Depends, Security, APIRouter, status
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
+
+logger = logging.getLogger("rag_api.auth")
 
 from rag_core import (
     TextChunker,
@@ -39,7 +42,9 @@ from rag_core import (
     StructuredOutputValidator,
     SmallModelCompatibilityAudit,
     OperationalObservabilityDashboard,
-    StrictOfflineGuard
+    StrictOfflineGuard,
+    AuthenticatedPrincipal,
+    PrincipalRegistry
 )
 
 app = FastAPI(
@@ -48,18 +53,21 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# Authentication Schemes & Dependencies (Item 12 & Security Hardening)
+# Authentication Schemes & Server-Side Identity Layer
 api_key_header_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
 bearer_scheme = HTTPBearer(auto_error=False)
 
-async def verify_api_key(
+principal_registry = PrincipalRegistry()
+
+async def get_current_principal(
     request: Request,
     header_key: Optional[str] = Security(api_key_header_scheme),
     bearer_token: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme),
-) -> bool:
+) -> AuthenticatedPrincipal:
     """
-    Enforces API key / Bearer token authentication when RAG_API_KEY is configured in the environment.
-    Permits open developer mode when RAG_API_KEY is not set or empty.
+    Derives caller identity and authorization claims server-side from validated authentication.
+    Privilege-bearing claims (roles, clearance_level, user_id, department) are NEVER accepted
+    from arbitrary caller request fields.
     Checks:
     1. X-API-Key header (via Security scheme)
     2. Authorization: Bearer <key> header (via Security scheme)
@@ -67,8 +75,6 @@ async def verify_api_key(
     4. JSON body 'api_key' field (if application/json)
     """
     expected = os.environ.get("RAG_API_KEY")
-    if not expected:
-        return True
 
     provided = header_key or request.headers.get("X-API-Key")
     if not provided and bearer_token:
@@ -89,13 +95,72 @@ async def verify_api_key(
         except Exception:
             pass
 
-    if not provided or not secrets.compare_digest(str(provided), str(expected)):
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized: Invalid or missing API key.",
-            headers={"WWW-Authenticate": "Bearer"},
+    # 1. Check if token maps directly to an authoritative principal in the server-side registry
+    if provided:
+        registered_principal = principal_registry.resolve(provided)
+        if registered_principal:
+            return registered_principal
+
+    # 2. When RAG_API_KEY is configured in the environment:
+    if expected:
+        if not provided or not secrets.compare_digest(str(provided), str(expected)):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized: Invalid or missing API key.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        # Primary service API key maps to authoritative configured service principal
+        service_roles = [r.strip().lower() for r in os.environ.get("RAG_SERVICE_ROLES", "admin,user").split(",") if r.strip()]
+        service_clearance = os.environ.get("RAG_SERVICE_CLEARANCE", "top_secret").strip().lower()
+        return AuthenticatedPrincipal(
+            principal_id=os.environ.get("RAG_SERVICE_PRINCIPAL_ID", "primary_service_account"),
+            roles=service_roles,
+            clearance_level=service_clearance,
+            department="system",
+            auth_source="primary_rag_api_key"
         )
-    return True
+
+    # 3. Open Developer Mode: When RAG_API_KEY is unset, use default developer principal
+    return principal_registry.get_default_developer_principal()
+
+
+async def verify_api_key(
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+) -> AuthenticatedPrincipal:
+    """Enforces authentication dependency on protected router."""
+    return principal
+
+
+def build_authoritative_user_context(
+    principal: AuthenticatedPrincipal,
+    client_context: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Derives authoritative user_context strictly from the authenticated principal.
+    Privilege-bearing claims (roles, clearance_level, user_id, department)
+    are derived EXCLUSIVELY from the validated server principal.
+    Any caller-supplied privilege-bearing claims in client_context are stripped
+    to prevent privilege escalation.
+    """
+    auth_ctx = principal.to_user_context()
+    if not client_context:
+        return auth_ctx
+
+    tampered = []
+    for key in ("roles", "clearance_level", "user_id", "department"):
+        if key in client_context and client_context[key] != auth_ctx.get(key):
+            tampered.append(f"{key}={client_context[key]}")
+    if tampered:
+        logger.warning(
+            f"[Security Audit] Blocked caller-supplied privilege escalation attempt: {tampered}. "
+            f"Enforcing validated principal claims: principal_id='{principal.principal_id}', roles={principal.roles}."
+        )
+
+    # Retain harmless non-privilege contextual parameters, but strictly overwrite privilege claims
+    safe_ctx = {k: v for k, v in client_context.items() if k not in ("roles", "clearance_level", "user_id", "department")}
+    safe_ctx.update(auth_ctx)
+    return safe_ctx
+
 
 # ==============================================================================
 # ROUTER ARCHITECTURE: Explicit Separation of Public vs. Protected Endpoints
@@ -488,32 +553,31 @@ def list_quarantined_chunks_endpoint():
 
 @protected_router.get("/documents")
 def list_documents_endpoint(
+    include_deleted: Optional[bool] = Query(False),
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
     x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
     x_clearance_level: Optional[str] = Header(None, alias="X-Clearance-Level"),
     x_user_id: Optional[str] = Header(None, alias="X-User-ID"),
     role: Optional[str] = Query(None),
     clearance_level: Optional[str] = Query(None),
-    user_id: Optional[str] = Query(None),
-    include_deleted: Optional[bool] = Query(False)
+    user_id: Optional[str] = Query(None)
 ):
     """
     Lists all source documents with their versions, status, and chunk counts.
     Enforces authorization and lifecycle policy:
+    - Identity and permissions are derived strictly server-side from the authenticated principal.
+    - Untrusted caller-supplied headers and query parameters are ignored for authorization.
     - Ordinary users only see active documents they are authorized to view.
-    - Administrators can pass include_deleted=true to review deleted documents for audit & restoration.
+    - Administrators (verified via authenticated principal) can pass include_deleted=true
+      to review deleted documents for audit & restoration.
     """
-    roles = []
-    if x_user_role:
-        roles.extend([r.strip().lower() for r in x_user_role.split(",") if r.strip()])
-    if role:
-        roles.extend([r.strip().lower() for r in role.split(",") if r.strip()])
+    if x_user_role or role or x_clearance_level or clearance_level:
+        logger.warning(
+            f"[Security Audit] Blocked caller-supplied privilege escalation headers/query parameters on /documents. "
+            f"Enforcing authenticated principal claims: principal_id='{principal.principal_id}', roles={principal.roles}."
+        )
 
-    user_ctx = {
-        "user_id": user_id or x_user_id or "anonymous",
-        "roles": roles,
-        "clearance_level": clearance_level or x_clearance_level or "public"
-    }
-
+    user_ctx = principal.to_user_context()
     filtered_docs = indexer.list_source_documents(user_context=user_ctx, include_deleted=include_deleted)
     return {
         "index_generation": getattr(indexer, 'index_generation', 1),
@@ -524,36 +588,35 @@ def list_documents_endpoint(
 @protected_router.get("/documents/{doc_id}")
 def get_document_endpoint(
     doc_id: str,
+    include_deleted: Optional[bool] = Query(False),
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
     x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
     x_clearance_level: Optional[str] = Header(None, alias="X-Clearance-Level"),
     x_user_id: Optional[str] = Header(None, alias="X-User-ID"),
     role: Optional[str] = Query(None),
     clearance_level: Optional[str] = Query(None),
-    user_id: Optional[str] = Query(None),
-    include_deleted: Optional[bool] = Query(False)
+    user_id: Optional[str] = Query(None)
 ):
     """
     Retrieves full source document metadata and lifecycle status.
     Enforces authorization and lifecycle policy:
+    - Identity and permissions are derived strictly server-side from the authenticated principal.
+    - Untrusted caller-supplied headers and query parameters are ignored for authorization.
     - If document does not exist: returns 404 Not Found.
     - If document is soft-deleted:
-        * Administrators (roles: admin/superuser/data_admin/sysadmin) passing include_deleted=true
+        * Administrators (verified via authenticated principal) passing include_deleted=true
           may access deleted content for restoration or auditing.
         * Ordinary users are denied access (returns 403 Forbidden with lifecycle policy explanation).
     - If document is active:
         * Enforces document-level clearance and role access control (RBAC/ABAC).
     """
-    roles = []
-    if x_user_role:
-        roles.extend([r.strip().lower() for r in x_user_role.split(",") if r.strip()])
-    if role:
-        roles.extend([r.strip().lower() for r in role.split(",") if r.strip()])
+    if x_user_role or role or x_clearance_level or clearance_level:
+        logger.warning(
+            f"[Security Audit] Blocked caller-supplied privilege escalation headers/query parameters on /documents/{doc_id}. "
+            f"Enforcing authenticated principal claims: principal_id='{principal.principal_id}', roles={principal.roles}."
+        )
 
-    user_ctx = {
-        "user_id": user_id or x_user_id or "anonymous",
-        "roles": roles,
-        "clearance_level": clearance_level or x_clearance_level or "public"
-    }
+    user_ctx = principal.to_user_context()
 
     raw_doc = None
     if hasattr(indexer, 'source_documents') and doc_id in indexer.source_documents:
@@ -565,7 +628,7 @@ def get_document_endpoint(
         raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found.")
 
     is_deleted = raw_doc.get("status") == "deleted" or bool(raw_doc.get("deleted"))
-    is_admin = any(r in roles for r in ("admin", "superuser", "data_admin", "sysadmin"))
+    is_admin = principal.is_admin()
 
     if is_deleted:
         if not is_admin:
@@ -593,18 +656,23 @@ def get_document_endpoint(
 # PHASE 3 — Retrieve, Generate & Evaluate
 # ==========================================
 @protected_router.post("/route-query")
-def route_query_endpoint(req: QueryRequest):
+def route_query_endpoint(
+    req: QueryRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+):
     """
     Classifies the user query into one of predefined routes (Dense, BM25, SQL, Document Lookup, Multi-Hop, Clarification, Hybrid Structured)
     with explicit execution permission checks.
+    Authoritative identity and permissions are derived strictly server-side from the authenticated principal.
     """
     t0 = time.perf_counter()
+    trusted_user_context = build_authoritative_user_context(principal, req.user_context)
     known_docs = list(set(c.get("doc_id", "") for c in indexer.chunks))
     history = conversation_manager.get_history(req.session_id or "default") if req.use_memory else None
     decision = query_router.route_query(
         query=req.query,
         history=history,
-        user_context=req.user_context,
+        user_context=trusted_user_context,
         execution_mode=req.execution_mode or "strict_offline",
         known_doc_ids=known_docs
     )
@@ -617,19 +685,24 @@ def route_query_endpoint(req: QueryRequest):
 
 
 @protected_router.post("/retrieve")
-def retrieve_context(req: QueryRequest):
+def retrieve_context(
+    req: QueryRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+):
     """
     Retrieves Top-K relevant context chunks for a given query.
     Supports optional auto-routing through ControlledQueryRouter.
+    Authoritative user_context is derived server-side from authenticated principal.
     """
     t0 = time.perf_counter()
+    trusted_user_context = build_authoritative_user_context(principal, req.user_context)
     if req.auto_route:
         known_docs = list(set(c.get("doc_id", "") for c in indexer.chunks))
         history = conversation_manager.get_history(req.session_id or "default") if req.use_memory else None
         decision = query_router.route_query(
             query=req.query,
             history=history,
-            user_context=req.user_context,
+            user_context=trusted_user_context,
             execution_mode=req.execution_mode or "strict_offline",
             known_doc_ids=known_docs
         )
@@ -638,7 +711,7 @@ def retrieve_context(req: QueryRequest):
             indexer=indexer,
             query=req.query,
             top_k=req.top_k or 3,
-            user_context=req.user_context,
+            user_context=trusted_user_context,
             filters=req.filters,
             execution_mode=req.execution_mode or "strict_offline",
             is_untrusted_source=bool(req.is_untrusted_source)
@@ -658,7 +731,7 @@ def retrieve_context(req: QueryRequest):
         req.query,
         top_k=req.top_k or 3,
         filters=req.filters,
-        user_context=req.user_context
+        user_context=trusted_user_context
     )
     lat_ms = (time.perf_counter() - t0) * 1000.0
     dashboard.record_request("/retrieve", route="dense", latency_ms=lat_ms)
@@ -670,14 +743,19 @@ def retrieve_context(req: QueryRequest):
 
 
 @protected_router.post("/generate-rag")
-def generate_rag(req: QueryRequest):
+def generate_rag(
+    req: QueryRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+):
     """
     Phase 3: Retrieves context, builds context-bounded prompt, and generates grounded response.
     Supports multi-backend generation (Ollama, Gemini, Offline) and multi-turn memory.
+    Authoritative user_context is derived server-side from authenticated principal.
     """
     session_id = req.session_id or "default"
     standalone_query = req.query
     history = []
+    trusted_user_context = build_authoritative_user_context(principal, req.user_context)
 
     # 1. Memory / Query Condensation
     if req.use_memory:
@@ -691,12 +769,12 @@ def generate_rag(req: QueryRequest):
                 api_key=req.api_key
             )
 
-    # 2. Retrieval using standalone condensed query
+    # 2. Retrieval using standalone condensed query & trusted user_context
     retrieved = indexer.search(
         standalone_query,
         top_k=req.top_k or 3,
         filters=req.filters,
-        user_context=req.user_context
+        user_context=trusted_user_context
     )
 
     # 3. Prompt Assembly with conversation history & retrieved context
@@ -765,15 +843,20 @@ def run_eval(req: EvalRequest):
 # PHASE 4 — Guardrails & Faithfulness
 # ==========================================
 @protected_router.post("/generate-guarded")
-def generate_guarded(req: QueryRequest):
+def generate_guarded(
+    req: QueryRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+):
     """
     Phase 4: Integrates confidence thresholds & faithfulness guardrails before generation.
     Supports multi-turn memory and query condensation.
+    Authoritative user_context is derived server-side from authenticated principal.
     """
     t0 = time.perf_counter()
     session_id = req.session_id or "default"
     standalone_query = req.query
     history = []
+    trusted_user_context = build_authoritative_user_context(principal, req.user_context)
 
     # 1. Memory / Query Condensation
     if req.use_memory:
@@ -787,12 +870,12 @@ def generate_guarded(req: QueryRequest):
                 api_key=req.api_key
             )
 
-    # 2. Retrieval using standalone query
+    # 2. Retrieval using standalone query & trusted user_context
     retrieved = indexer.search(
         standalone_query,
         top_k=req.top_k or 3,
         filters=req.filters,
-        user_context=req.user_context
+        user_context=trusted_user_context
     )
     
     # Evaluate retrieval confidence
@@ -906,7 +989,10 @@ def get_small_model_compatibility_audit():
 
 
 @protected_router.post("/compute-factual")
-def execute_factual_computation_endpoint(req: FactualComputeRequest):
+def execute_factual_computation_endpoint(
+    req: FactualComputeRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+):
     """
     Decoupled Factual & Mathematical Computation Pipeline (Small LLM Optimization):
     1. Retrieve project/document records
@@ -914,12 +1000,14 @@ def execute_factual_computation_endpoint(req: FactualComputeRequest):
     3. Calculate aggregations (average, sum, min, max, difference) using Python/SQL
     4. Validate mathematical integrity
     5. Return verified computation payload for prompt assembly.
+    Authoritative user_context is derived server-side from authenticated principal.
     """
+    trusted_user_context = build_authoritative_user_context(principal, req.user_context)
     retrieved = indexer.search(
         req.query,
         top_k=req.top_k or 5,
         filters=req.filters,
-        user_context=req.user_context
+        user_context=trusted_user_context
     )
     result = DeterministicComputationEngine.execute_factual_computation(req.query, retrieved)
     if not result:

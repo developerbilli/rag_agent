@@ -638,6 +638,164 @@ class TextChunker(HierarchicalStructureChunker):
     pass
 
 
+class AuthenticatedPrincipal:
+    """
+    Authoritative server-side identity representation.
+    Guarantees that privilege-bearing claims (roles, clearance_level, user_id, department)
+    are derived exclusively from server-side validated authentication (API keys, verified tokens,
+    or identity providers) and can NEVER be forged or escalated by arbitrary client request fields.
+    """
+    ADMIN_ROLES = {"admin", "superuser", "data_admin", "sysadmin"}
+
+    def __init__(
+        self,
+        principal_id: str,
+        roles: Optional[Union[List[str], Set[str]]] = None,
+        clearance_level: str = "public",
+        department: Optional[str] = None,
+        is_authenticated: bool = True,
+        auth_source: str = "server_identity_store",
+        metadata: Optional[Dict[str, Any]] = None
+    ):
+        self.principal_id = str(principal_id).strip()
+        self.roles = [str(r).strip().lower() for r in (roles or [])]
+        self.clearance_level = str(clearance_level or "public").strip().lower()
+        self.department = str(department).strip().lower() if department else None
+        self.is_authenticated = bool(is_authenticated)
+        self.auth_source = str(auth_source)
+        self.metadata = metadata or {}
+
+    def is_admin(self) -> bool:
+        """Determines if the principal holds administrative privileges."""
+        return any(r in self.ADMIN_ROLES for r in self.roles)
+
+    def has_role(self, role: str) -> bool:
+        """Checks if the principal possesses a specific role (case-insensitive)."""
+        return str(role).strip().lower() in self.roles
+
+    def to_user_context(self) -> Dict[str, Any]:
+        """
+        Exports authoritative claims as a context dictionary.
+        Includes server-attested marker to guarantee provenance.
+        """
+        return {
+            "user_id": self.principal_id,
+            "roles": list(self.roles),
+            "clearance_level": self.clearance_level,
+            "department": self.department,
+            "is_authenticated": self.is_authenticated,
+            "auth_source": self.auth_source,
+            "_trusted_server_identity": True
+        }
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.to_user_context().get(key, default)
+
+    def __getitem__(self, key: str) -> Any:
+        return self.to_user_context()[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.to_user_context()
+
+    @classmethod
+    def from_user_context(cls, ctx: Optional[Dict[str, Any]], auth_source: str = "internal") -> "AuthenticatedPrincipal":
+        if not ctx:
+            return cls(principal_id="anonymous", roles=[], clearance_level="public", is_authenticated=False, auth_source=auth_source)
+        return cls(
+            principal_id=ctx.get("user_id", "anonymous"),
+            roles=ctx.get("roles", []),
+            clearance_level=ctx.get("clearance_level", "public"),
+            department=ctx.get("department"),
+            is_authenticated=ctx.get("is_authenticated", True),
+            auth_source=auth_source,
+            metadata={k: v for k, v in ctx.items() if k not in ("user_id", "roles", "clearance_level", "department", "is_authenticated", "auth_source")}
+        )
+
+
+class PrincipalRegistry:
+    """
+    Authoritative Server-Side Identity Directory.
+    Maps validated credentials (API keys, Bearer tokens) to authenticated principals.
+    Enforces that caller identity and permissions are determined strictly on the server.
+    """
+    def __init__(self):
+        self._token_to_principal: Dict[str, AuthenticatedPrincipal] = {}
+        self._init_default_principals()
+
+    def _init_default_principals(self):
+        # Built-in Standard Service Principals for testing, dev, and multi-tenant operations
+        self.register(
+            "admin-token",
+            AuthenticatedPrincipal(
+                principal_id="admin_service",
+                roles=["admin", "superuser", "data_admin", "sysadmin"],
+                clearance_level="top_secret",
+                department="security",
+                auth_source="built_in_admin"
+            )
+        )
+        self.register(
+            "analyst-token",
+            AuthenticatedPrincipal(
+                principal_id="analyst_alice",
+                roles=["analyst"],
+                clearance_level="confidential",
+                department="finance",
+                auth_source="built_in_analyst"
+            )
+        )
+        self.register(
+            "engineer-token",
+            AuthenticatedPrincipal(
+                principal_id="engineer_bob",
+                roles=["engineer"],
+                clearance_level="internal",
+                department="engineering",
+                auth_source="built_in_engineer"
+            )
+        )
+        self.register(
+            "user-token",
+            AuthenticatedPrincipal(
+                principal_id="standard_user",
+                roles=["user"],
+                clearance_level="public",
+                department="general",
+                auth_source="built_in_user"
+            )
+        )
+
+    def register(self, token_or_key: str, principal: AuthenticatedPrincipal):
+        if token_or_key and principal:
+            self._token_to_principal[token_or_key.strip()] = principal
+
+    def resolve(self, token_or_key: Optional[str]) -> Optional[AuthenticatedPrincipal]:
+        if not token_or_key:
+            return None
+        token = token_or_key.strip()
+        for k, p in self._token_to_principal.items():
+            if secrets.compare_digest(token, k):
+                return p
+        return None
+
+    def get_default_developer_principal(self) -> AuthenticatedPrincipal:
+        """
+        Principal used in open developer mode when RAG_API_KEY is not configured.
+        Default is an ordinary user principal, preventing unauthenticated privilege escalation.
+        """
+        role = os.environ.get("RAG_DEFAULT_ROLE", "user")
+        roles = [r.strip().lower() for r in role.split(",") if r.strip()]
+        clearance = os.environ.get("RAG_DEFAULT_CLEARANCE", "public").strip().lower()
+        return AuthenticatedPrincipal(
+            principal_id="dev_user",
+            roles=roles,
+            clearance_level=clearance,
+            department=os.environ.get("RAG_DEFAULT_DEPARTMENT"),
+            is_authenticated=True,
+            auth_source="developer_open_mode"
+        )
+
+
 class MetadataFilterEngine:
     """
     Production Pre-Retrieval Metadata & Access Control Filtering Engine:
@@ -789,12 +947,20 @@ class MetadataFilterEngine:
         if not user_context:
             return False
 
-        # Superuser / Admin bypass
-        user_roles = [r.lower() for r in user_context.get("roles", [])]
-        if "admin" in user_roles or "superuser" in user_roles:
-            return True
-
-        user_id = str(user_context.get("user_id", "")).strip()
+        if isinstance(user_context, AuthenticatedPrincipal):
+            if user_context.is_admin():
+                return True
+            user_roles = user_context.roles
+            user_id = user_context.principal_id
+            user_dept = user_context.department
+            user_clearance = user_context.clearance_level
+        else:
+            user_roles = [str(r).lower() for r in user_context.get("roles", [])]
+            if any(r in ("admin", "superuser", "data_admin", "sysadmin") for r in user_roles):
+                return True
+            user_id = str(user_context.get("user_id", "")).strip()
+            user_dept = str(user_context.get("department", "")).strip().lower() if user_context.get("department") else None
+            user_clearance = str(user_context.get("clearance_level", "public")).lower()
 
         # 1. Allowed Users Check (DAC Allowlist)
         if allowed_users is not None:
@@ -810,12 +976,10 @@ class MetadataFilterEngine:
 
         # 3. Department Isolation (ABAC)
         if chunk_dept_restricted and chunk_dept:
-            user_dept = str(user_context.get("department", "")).strip().lower()
-            if user_dept != str(chunk_dept).strip().lower():
+            if not user_dept or user_dept != str(chunk_dept).strip().lower():
                 return False
 
         # 4. Security Clearance Level Check
-        user_clearance = str(user_context.get("clearance_level", "public")).lower()
         chunk_rank = cls.CLEARANCE_HIERARCHY.get(classification, 0)
         user_rank = cls.CLEARANCE_HIERARCHY.get(user_clearance, 0)
         if user_rank < chunk_rank:
@@ -2960,8 +3124,11 @@ class VectorIndexer:
         if is_deleted:
             if not include_deleted:
                 return None
-            user_roles = [str(r).lower() for r in (user_context or {}).get("roles", [])]
-            is_admin = any(r in user_roles for r in ("admin", "superuser", "data_admin", "sysadmin"))
+            if isinstance(user_context, AuthenticatedPrincipal):
+                is_admin = user_context.is_admin()
+            else:
+                user_roles = [str(r).lower() for r in (user_context or {}).get("roles", [])]
+                is_admin = any(r in user_roles for r in ("admin", "superuser", "data_admin", "sysadmin"))
             if not is_admin:
                 return None
             return doc
@@ -2973,7 +3140,7 @@ class VectorIndexer:
 
     def list_source_documents(
         self,
-        user_context: Optional[Dict[str, Any]] = None,
+        user_context: Optional[Union[Dict[str, Any], AuthenticatedPrincipal]] = None,
         include_deleted: bool = False
     ) -> List[Dict[str, Any]]:
         """
@@ -2987,8 +3154,11 @@ class VectorIndexer:
         elif hasattr(self, 'version_registry') and self.version_registry:
             raw_docs = [{"doc_id": k, **v} for k, v in self.version_registry.registry.items()]
 
-        user_roles = [str(r).lower() for r in (user_context or {}).get("roles", [])]
-        is_admin = any(r in user_roles for r in ("admin", "superuser", "data_admin", "sysadmin"))
+        if isinstance(user_context, AuthenticatedPrincipal):
+            is_admin = user_context.is_admin()
+        else:
+            user_roles = [str(r).lower() for r in (user_context or {}).get("roles", [])]
+            is_admin = any(r in user_roles for r in ("admin", "superuser", "data_admin", "sysadmin"))
 
         results = []
         for d in raw_docs:

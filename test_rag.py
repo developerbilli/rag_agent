@@ -27,7 +27,9 @@ from rag_core import (
     NeuralCrossEncoderReRanker, HeuristicReRanker,
     DiskBackedVectorStore,
     OperationalObservabilityDashboard,
-    ModelUpgradeRollbackError
+    ModelUpgradeRollbackError,
+    AuthenticatedPrincipal,
+    PrincipalRegistry
 )
 
 class TestOfflineRAGPipeline(unittest.TestCase):
@@ -3359,34 +3361,34 @@ class TestAdvancedCapabilitiesPhase4(unittest.TestCase):
         client = TestClient(app)
 
         # 7a: Ordinary user requests soft-deleted document -> 403 Forbidden
-        user_res = client.get("/documents/api_deleted", headers={"X-User-Role": "user"})
+        user_res = client.get("/documents/api_deleted", headers={"Authorization": "Bearer user-token"})
         self.assertEqual(user_res.status_code, 403)
         self.assertIn("soft-deleted", user_res.json()["detail"])
 
         # 7b: Admin requests soft-deleted document without include_deleted=True -> 403 Forbidden
-        admin_res_no_flag = client.get("/documents/api_deleted", headers={"X-User-Role": "admin"})
+        admin_res_no_flag = client.get("/documents/api_deleted", headers={"Authorization": "Bearer admin-token"})
         self.assertEqual(admin_res_no_flag.status_code, 403)
         self.assertIn("include_deleted=true", admin_res_no_flag.json()["detail"])
 
         # 7c: Admin requests soft-deleted document WITH include_deleted=True -> 200 OK for restoration inspection
-        admin_res_with_flag = client.get("/documents/api_deleted?include_deleted=true", headers={"X-User-Role": "admin"})
+        admin_res_with_flag = client.get("/documents/api_deleted?include_deleted=true", headers={"Authorization": "Bearer admin-token"})
         self.assertEqual(admin_res_with_flag.status_code, 200)
         self.assertEqual(admin_res_with_flag.json()["doc_id"], "api_deleted")
         self.assertEqual(admin_res_with_flag.json()["status"], "deleted")
 
         # 7d: Non-existent document -> 404 Not Found
-        not_found_res = client.get("/documents/non_existent_doc_123", headers={"X-User-Role": "admin"})
+        not_found_res = client.get("/documents/non_existent_doc_123", headers={"Authorization": "Bearer admin-token"})
         self.assertEqual(not_found_res.status_code, 404)
 
         # 7e: List documents: ordinary user only sees active documents
-        list_user = client.get("/documents", headers={"X-User-Role": "user"})
+        list_user = client.get("/documents", headers={"Authorization": "Bearer user-token"})
         self.assertEqual(list_user.status_code, 200)
         user_doc_ids = [d["doc_id"] for d in list_user.json()["documents"]]
         self.assertIn("api_active", user_doc_ids)
         self.assertNotIn("api_deleted", user_doc_ids)
 
         # 7f: List documents: admin with include_deleted=True sees both active and deleted documents
-        list_admin = client.get("/documents?include_deleted=true", headers={"X-User-Role": "admin"})
+        list_admin = client.get("/documents?include_deleted=true", headers={"Authorization": "Bearer admin-token"})
         self.assertEqual(list_admin.status_code, 200)
         admin_doc_ids = [d["doc_id"] for d in list_admin.json()["documents"]]
         self.assertIn("api_active", admin_doc_ids)
@@ -3761,11 +3763,11 @@ class TestFailureOrientedScenarios(unittest.TestCase):
         main_indexer.delete_document("api_secret", hard_delete=False)
 
         client = TestClient(app)
-        api_res = client.get("/documents/api_secret", headers={"X-User-Role": "user"})
+        api_res = client.get("/documents/api_secret", headers={"Authorization": "Bearer user-token"})
         self.assertEqual(api_res.status_code, 403)
         self.assertIn("soft-deleted", api_res.json()["detail"])
 
-        list_res = client.get("/documents", headers={"X-User-Role": "user"})
+        list_res = client.get("/documents", headers={"Authorization": "Bearer user-token"})
         self.assertNotIn("api_secret", [d["doc_id"] for d in list_res.json()["documents"]])
 
     def test_fail_06_repeated_deletion_is_idempotent(self):
@@ -4151,6 +4153,147 @@ class TestAPIAuthenticationAndRouteSeparation(unittest.TestCase):
             headers={"X-API-Key": test_key}
         )
         self.assertEqual(res_clear_auth.status_code, 200)
+
+
+class TestServerSideAuthorizationAndIdentityIntegrity(unittest.TestCase):
+    """
+    Security verification tests proving that caller-supplied privilege claims
+    (roles, clearance_level, user_id, department in headers, query params, or body)
+    are strictly rejected or neutralized, and authorization claims are derived
+    exclusively from validated server-side principals.
+    """
+
+    def setUp(self):
+        from main import app, indexer as main_indexer, chunker as main_chunker
+        from fastapi.testclient import TestClient
+        self.app = app
+        self.indexer = main_indexer
+        self.chunker = main_chunker
+        self.client = TestClient(app)
+
+        # Stage and commit test documents
+        self.indexer.clear()
+        # 1. Public document
+        self.indexer.stage_and_commit_document("doc_pub", "Public general information about Python.", "Python Public", self.chunker)
+        
+        # 2. Top-secret admin document
+        self.indexer.stage_and_commit_document(
+            "doc_secret_admin",
+            "Classified project runway details for administrators.",
+            "Admin Secret",
+            self.chunker,
+            metadata={"allowed_roles": ["admin"], "clearance_level": "top_secret"}
+        )
+
+        # 3. Soft-deleted document
+        self.indexer.stage_and_commit_document("doc_soft_del", "Archived strategic document.", "Archived", self.chunker)
+        self.indexer.delete_document("doc_soft_del", hard_delete=False)
+
+    def test_sec_01_caller_supplied_admin_role_in_request_body_is_neutralized(self):
+        """
+        Critical exploit test: An ordinary user cannot access admin-only or top_secret chunks
+        by forging 'user_context': {'roles': ['admin'], 'clearance_level': 'top_secret'} in POST /retrieve.
+        """
+        # User authenticates with ordinary user token
+        exploit_payload = {
+            "query": "Classified project runway details",
+            "top_k": 5,
+            "user_context": {
+                "roles": ["admin", "superuser"],
+                "clearance_level": "top_secret",
+                "user_id": "malicious_actor"
+            }
+        }
+        res = self.client.post(
+            "/retrieve",
+            json=exploit_payload,
+            headers={"Authorization": "Bearer user-token"}
+        )
+        self.assertEqual(res.status_code, 200)
+        retrieved_ids = [c["doc_id"] for c in res.json().get("retrieved_chunks", [])]
+        # Admin-only document MUST NOT be retrieved!
+        self.assertNotIn("doc_secret_admin", retrieved_ids)
+
+    def test_sec_02_validated_admin_token_retrieves_restricted_chunks(self):
+        """Legitimate admin presenting authenticated admin-token retrieves top_secret chunks."""
+        req_payload = {
+            "query": "Classified project runway details",
+            "top_k": 5
+        }
+        res = self.client.post(
+            "/retrieve",
+            json=req_payload,
+            headers={"Authorization": "Bearer admin-token"}
+        )
+        self.assertEqual(res.status_code, 200)
+        retrieved_ids = [c["doc_id"] for c in res.json().get("retrieved_chunks", [])]
+        self.assertIn("doc_secret_admin", retrieved_ids)
+
+    def test_sec_03_caller_supplied_x_user_role_header_ignored_in_list_documents(self):
+        """
+        Header tampering test: Ordinary user passing X-User-Role: admin CANNOT view soft-deleted documents.
+        """
+        # Caller supplies ordinary user-token while attempting header injection
+        res = self.client.get(
+            "/documents?include_deleted=true",
+            headers={
+                "Authorization": "Bearer user-token",
+                "X-User-Role": "admin,superuser",
+                "X-Clearance-Level": "top_secret"
+            }
+        )
+        self.assertEqual(res.status_code, 200)
+        doc_ids = [d["doc_id"] for d in res.json().get("documents", [])]
+        self.assertIn("doc_pub", doc_ids)
+        self.assertNotIn("doc_soft_del", doc_ids)  # Soft-deleted document protected!
+
+    def test_sec_04_caller_supplied_x_user_role_header_ignored_in_get_document(self):
+        """
+        Header tampering test: Ordinary user passing X-User-Role: admin CANNOT access soft-deleted document endpoint.
+        """
+        res = self.client.get(
+            "/documents/doc_soft_del?include_deleted=true",
+            headers={
+                "Authorization": "Bearer user-token",
+                "X-User-Role": "admin"
+            }
+        )
+        self.assertEqual(res.status_code, 403)
+        self.assertIn("Administrator authorization required", res.json().get("detail", ""))
+
+    def test_sec_05_authenticated_principal_direct_access_control(self):
+        """Direct domain verification of AuthenticatedPrincipal in MetadataFilterEngine."""
+        user_p = AuthenticatedPrincipal(principal_id="alice", roles=["user"], clearance_level="public")
+        admin_p = AuthenticatedPrincipal(principal_id="root", roles=["admin"], clearance_level="top_secret")
+
+        restricted_chunk = {
+            "chunk_id": "c1",
+            "metadata": {
+                "allowed_roles": ["admin"],
+                "clearance_level": "top_secret"
+            }
+        }
+
+        self.assertFalse(MetadataFilterEngine.evaluate_access_control(restricted_chunk, user_p))
+        self.assertTrue(MetadataFilterEngine.evaluate_access_control(restricted_chunk, admin_p))
+
+    def test_sec_06_build_authoritative_user_context_strips_privilege_escalation(self):
+        """Unit test confirming build_authoritative_user_context strictly replaces privilege claims."""
+        from main import build_authoritative_user_context
+        user_p = AuthenticatedPrincipal(principal_id="bob", roles=["user"], clearance_level="public", department="eng")
+        tampered_client_ctx = {
+            "roles": ["admin", "superuser"],
+            "clearance_level": "top_secret",
+            "department": "finance",
+            "user_id": "root",
+            "safe_search_param": "strict"
+        }
+        safe_ctx = build_authoritative_user_context(user_p, tampered_client_ctx)
+        self.assertEqual(safe_ctx["roles"], ["user"])
+        self.assertEqual(safe_ctx["clearance_level"], "public")
+        self.assertEqual(safe_ctx["user_id"], "bob")
+        self.assertEqual(safe_ctx["department"], "eng")
+        self.assertEqual(safe_ctx["safe_search_param"], "strict")
 
 
 if __name__ == "__main__":
