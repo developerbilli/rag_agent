@@ -4077,44 +4077,59 @@ class TestAPIAuthenticationAndRouteSeparation(unittest.TestCase):
         self.assertEqual(res_doc_get.status_code, 401)
 
     def test_auth_03_reject_invalid_api_keys(self):
-        """Invalid API keys in headers, params, or body are rejected with 401."""
+        """Invalid API keys in headers, params, or body are rejected."""
         test_key = "secure-production-api-key"
         os.environ["RAG_API_KEY"] = test_key
 
-        # Invalid header
+        # Invalid header -> 401
         res1 = self.client.get("/documents", headers={"X-API-Key": "invalid-key"})
         self.assertEqual(res1.status_code, 401)
 
-        # Invalid Bearer token
+        # Invalid Bearer token -> 401
         res2 = self.client.get("/documents", headers={"Authorization": "Bearer invalid-bearer"})
         self.assertEqual(res2.status_code, 401)
 
-        # Invalid query param
+        # Insecure query param is rejected in production -> 400
         res3 = self.client.get("/documents?api_key=wrong-query-key")
-        self.assertEqual(res3.status_code, 401)
+        self.assertEqual(res3.status_code, 400)
 
-        # Invalid body key
+        # Insecure body key is rejected in production -> 400
         res4 = self.client.post("/retrieve", json={"query": "test", "api_key": "wrong-body-key"})
-        self.assertEqual(res4.status_code, 401)
+        self.assertEqual(res4.status_code, 400)
 
-    def test_auth_04_accept_valid_credentials_across_all_schemes(self):
-        """Valid credentials succeed via X-API-Key, Authorization Bearer, query param, and JSON body."""
+    def test_auth_04_headers_accepted_and_query_body_rejected_in_production(self):
+        """In production, X-API-Key and Bearer succeed, while query and body credentials are rejected."""
         test_key = "master-rag-access-key-42"
         os.environ["RAG_API_KEY"] = test_key
+        os.environ.pop("RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT", None)
 
-        # 1. X-API-Key header
+        # 1. X-API-Key header succeeds
         res1 = self.client.get("/documents", headers={"X-API-Key": test_key})
         self.assertEqual(res1.status_code, 200)
 
-        # 2. Authorization Bearer header
+        # 2. Authorization Bearer header succeeds
         res2 = self.client.get("/documents", headers={"Authorization": f"Bearer {test_key}"})
         self.assertEqual(res2.status_code, 200)
 
-        # 3. Query parameter
+        # 3. Query parameter is strictly rejected in production (HTTP 400 Bad Request)
+        res3 = self.client.get(f"/documents?api_key={test_key}")
+        self.assertEqual(res3.status_code, 400)
+        self.assertIn("URL query parameters is prohibited", res3.json()["detail"])
+
+        # 4. JSON body key is strictly rejected in production (HTTP 400 Bad Request)
+        res4 = self.client.post("/retrieve", json={"query": "test", "top_k": 1, "api_key": test_key})
+        self.assertEqual(res4.status_code, 400)
+        self.assertIn("request body is prohibited", res4.json()["detail"])
+
+    def test_auth_04b_insecure_transport_opt_in_allows_query_body(self):
+        """When explicitly allowed via RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT=true, query and body are accepted."""
+        test_key = "master-rag-access-key-42"
+        os.environ["RAG_API_KEY"] = test_key
+        os.environ["RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT"] = "true"
+
         res3 = self.client.get(f"/documents?api_key={test_key}")
         self.assertEqual(res3.status_code, 200)
 
-        # 4. JSON body key on POST
         res4 = self.client.post("/retrieve", json={"query": "test", "top_k": 1, "api_key": test_key})
         self.assertEqual(res4.status_code, 200)
 
@@ -5528,6 +5543,175 @@ class TestUploadDoSProtectionAndStreamingLimits(unittest.TestCase):
         # Confirm documents are in index
         search_res = self.indexer.search("Vector embeddings", top_k=2)
         self.assertGreater(len(search_res), 0)
+
+
+class TestHeaderAuthenticationAndLogRedaction(unittest.TestCase):
+    """
+    Test suite verifying strict header-only authentication enforcement in production
+    and automatic redaction of authorization credentials in logs:
+    - X-API-Key and Authorization Bearer headers succeed
+    - Query parameter credentials (?api_key=...) are rejected with HTTP 400
+    - Request body credentials ({"api_key": ...}) are rejected with HTTP 400
+    - Query parameter credentials alongside valid header are still rejected
+    - Insecure credential transport flag opt-in in non-prod
+    - SensitiveHeaderRedactionFilter redacts Bearer tokens, API keys, and query credentials from logs
+    - redact_headers() sanitizes dictionary of headers
+    """
+
+    def setUp(self):
+        self.env_backup = {
+            "RAG_API_KEY": os.environ.get("RAG_API_KEY"),
+            "RAG_ALLOW_BUILTIN_TOKENS": os.environ.get("RAG_ALLOW_BUILTIN_TOKENS"),
+            "RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT": os.environ.get("RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT"),
+            "RAG_ENFORCE_HEADER_AUTH": os.environ.get("RAG_ENFORCE_HEADER_AUTH"),
+        }
+        from fastapi.testclient import TestClient
+        from main import app, redact_headers, SensitiveHeaderRedactionFilter
+        self.client = TestClient(app)
+        self.redact_headers = redact_headers
+        self.SensitiveHeaderRedactionFilter = SensitiveHeaderRedactionFilter
+
+    def tearDown(self):
+        for k, v in self.env_backup.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+
+    def test_strict_auth_01_headers_succeed(self):
+        """Header-based authentication succeeds with 200 via both standard forms."""
+        test_key = "production-header-key-777"
+        os.environ["RAG_API_KEY"] = test_key
+        os.environ.pop("RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT", None)
+
+        res_x_api = self.client.get("/documents", headers={"X-API-Key": test_key})
+        self.assertEqual(res_x_api.status_code, 200)
+
+        res_bearer = self.client.get("/documents", headers={"Authorization": f"Bearer {test_key}"})
+        self.assertEqual(res_bearer.status_code, 200)
+
+    def test_strict_auth_02_query_param_rejected_even_if_key_is_valid(self):
+        """Query parameter credentials are strictly rejected in production to prevent URL/log leakage."""
+        test_key = "production-header-key-777"
+        os.environ["RAG_API_KEY"] = test_key
+        os.environ.pop("RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT", None)
+
+        res = self.client.get(f"/documents?api_key={test_key}")
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("URL query parameters is prohibited", res.json()["detail"])
+
+    def test_strict_auth_03_json_body_credential_rejected_even_if_key_is_valid(self):
+        """JSON body credentials are strictly rejected in production."""
+        test_key = "production-header-key-777"
+        os.environ["RAG_API_KEY"] = test_key
+        os.environ.pop("RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT", None)
+
+        res = self.client.post("/retrieve", json={"query": "test query", "api_key": test_key})
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("request body is prohibited", res.json()["detail"])
+
+    def test_strict_auth_04_query_param_alongside_valid_header_is_rejected(self):
+        """Even when a valid header is provided, the presence of query credentials is rejected."""
+        test_key = "production-header-key-777"
+        os.environ["RAG_API_KEY"] = test_key
+        os.environ.pop("RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT", None)
+
+        headers = {"Authorization": f"Bearer {test_key}"}
+        res = self.client.get(f"/documents?api_key={test_key}", headers=headers)
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("URL query parameters is prohibited", res.json()["detail"])
+
+    def test_strict_auth_05_opt_in_allows_query_param_in_non_prod(self):
+        """RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT=true relaxes strict transport for dev/testing."""
+        test_key = "production-header-key-777"
+        os.environ["RAG_API_KEY"] = test_key
+        os.environ["RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT"] = "true"
+
+        res = self.client.get(f"/documents?api_key={test_key}")
+        self.assertEqual(res.status_code, 200)
+
+    def test_log_redaction_01_bearer_token_masked_in_log_records(self):
+        """SensitiveHeaderRedactionFilter replaces Bearer tokens with [REDACTED]."""
+        import io
+        import logging
+
+        logger = logging.getLogger("test.redact.bearer")
+        logger.setLevel(logging.INFO)
+        filter_inst = self.SensitiveHeaderRedactionFilter()
+        logger.addFilter(filter_inst)
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.addFilter(filter_inst)
+        logger.addHandler(handler)
+
+        logger.info("Client authenticated with Authorization: Bearer secret-production-key-998877")
+        logged_text = stream.getvalue()
+
+        self.assertNotIn("secret-production-key-998877", logged_text)
+        self.assertIn("[REDACTED]", logged_text)
+
+    def test_log_redaction_02_x_api_key_masked_in_log_records(self):
+        """SensitiveHeaderRedactionFilter replaces X-API-Key with [REDACTED]."""
+        import io
+        import logging
+
+        logger = logging.getLogger("test.redact.apikey")
+        logger.setLevel(logging.INFO)
+        filter_inst = self.SensitiveHeaderRedactionFilter()
+        logger.addFilter(filter_inst)
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.addFilter(filter_inst)
+        logger.addHandler(handler)
+
+        logger.warning("Header dump: {'X-API-Key': 'my-super-secret-key-12345', 'User-Agent': 'python-test'}")
+        logged_text = stream.getvalue()
+
+        self.assertNotIn("my-super-secret-key-12345", logged_text)
+        self.assertIn("[REDACTED]", logged_text)
+        self.assertIn("User-Agent", logged_text)
+
+    def test_log_redaction_03_query_param_key_masked_in_log_records(self):
+        """SensitiveHeaderRedactionFilter replaces ?api_key=... in logged URLs with [REDACTED]."""
+        import io
+        import logging
+
+        logger = logging.getLogger("test.redact.query")
+        logger.setLevel(logging.INFO)
+        filter_inst = self.SensitiveHeaderRedactionFilter()
+        logger.addFilter(filter_inst)
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.addFilter(filter_inst)
+        logger.addHandler(handler)
+
+        logger.info("Request path: /documents?api_key=leaked-url-token&filter=active")
+        logged_text = stream.getvalue()
+
+        self.assertNotIn("leaked-url-token", logged_text)
+        self.assertIn("api_key=[REDACTED]", logged_text)
+
+    def test_log_redaction_04_redact_headers_dictionary_utility(self):
+        """redact_headers() sanitizes sensitive HTTP header fields in dictionary representation."""
+        raw_headers = {
+            "Host": "rag.internal.company.com",
+            "Authorization": "Bearer top-secret-oauth-token",
+            "X-API-Key": "secret-admin-key",
+            "Cookie": "session_id=12345; auth=token",
+            "Content-Type": "application/json",
+            "Accept": "*/*"
+        }
+        redacted = self.redact_headers(raw_headers)
+
+        self.assertEqual(redacted["Authorization"], "[REDACTED]")
+        self.assertEqual(redacted["X-API-Key"], "[REDACTED]")
+        self.assertEqual(redacted["Cookie"], "[REDACTED]")
+        self.assertEqual(redacted["Host"], "rag.internal.company.com")
+        self.assertEqual(redacted["Content-Type"], "application/json")
+        self.assertEqual(redacted["Accept"], "*/*")
 
 
 if __name__ == "__main__":

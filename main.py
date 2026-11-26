@@ -9,6 +9,7 @@ Interactive Web UI: (/ and /ui)
 """
 
 import os
+import re
 import time
 import secrets
 import logging
@@ -19,6 +20,61 @@ from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger("rag_api.auth")
+
+# ==============================================================================
+# Sensitive Header Redaction Filter & Log Masking
+# ==============================================================================
+class SensitiveHeaderRedactionFilter(logging.Filter):
+    """
+    Log filter that intercepts log records across all loggers (including root, uvicorn,
+    uvicorn.access, and rag_api.auth) and redacts authorization headers, Bearer tokens,
+    and API key query parameters to prevent secret leakage in logs, traces, and metrics.
+    """
+    PATTERNS = [
+        (re.compile(r'(?i)(bearer\s+)[A-Za-z0-9_\-\.]+'), r'\1[REDACTED]'),
+        (re.compile(r'(?i)(authorization["\']?\s*[:=]\s*["\']?)(?:Bearer\s+)?[^"\'\s,;}]+'), r'\1[REDACTED]'),
+        (re.compile(r'(?i)(x-api-key["\']?\s*[:=]\s*["\']?)[^"\'\s,;}]+'), r'\1[REDACTED]'),
+        (re.compile(r'(?i)(api[_-]?key["\']?\s*[:=]\s*["\']?)[^"\'\s,;}]+'), r'\1[REDACTED]'),
+        (re.compile(r'(?i)(\?|&)api_key=[^&\s]+'), r'\1api_key=[REDACTED]'),
+    ]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            for pattern, repl in self.PATTERNS:
+                record.msg = pattern.sub(repl, record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {k: (self._sanitize(v) if isinstance(v, str) else v) for k, v in record.args.items()}
+            elif isinstance(record.args, (list, tuple)):
+                record.args = tuple(self._sanitize(a) if isinstance(a, str) else a for a in record.args)
+        return True
+
+    def _sanitize(self, val: str) -> str:
+        for pattern, repl in self.PATTERNS:
+            val = pattern.sub(repl, val)
+        return val
+
+
+def redact_headers(headers: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Sanitizes a dictionary of HTTP headers, replacing sensitive credentials with [REDACTED].
+    """
+    sensitive_keys = {"authorization", "x-api-key", "api-key", "cookie", "set-cookie", "token"}
+    redacted = {}
+    for k, v in headers.items():
+        if k.lower() in sensitive_keys:
+            redacted[k] = "[REDACTED]"
+        else:
+            redacted[k] = v
+    return redacted
+
+
+# Attach redaction filter to auth logger, root logger, and ASGI/Uvicorn loggers
+_redaction_filter = SensitiveHeaderRedactionFilter()
+logger.addFilter(_redaction_filter)
+logging.getLogger().addFilter(_redaction_filter)
+for _logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error", "fastapi"):
+    logging.getLogger(_logger_name).addFilter(_redaction_filter)
 
 from rag_core import (
     TextChunker,
@@ -155,6 +211,20 @@ def are_builtin_tokens_allowed() -> bool:
     return True
 
 
+def is_strict_header_auth_enforced() -> bool:
+    """
+    In production (when RAG_API_KEY is configured or RAG_ENV/ENVIRONMENT is production),
+    strict header-only authentication is enforced. Query parameter and body credentials
+    are strictly rejected to prevent credential leakage in access logs, browser history,
+    and monitoring traces.
+    Can be explicitly relaxed in non-production environments with RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT=true.
+    """
+    if os.environ.get("RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT", "").strip().lower() in ("true", "1", "yes"):
+        return False
+    return is_production_auth_configured() or \
+           os.environ.get("RAG_ENFORCE_HEADER_AUTH", "").strip().lower() in ("true", "1", "yes")
+
+
 async def get_current_principal(
     request: Request,
     header_key: Optional[str] = Security(api_key_header_scheme),
@@ -164,15 +234,46 @@ async def get_current_principal(
     Derives caller identity and authorization claims server-side from validated authentication.
     Privilege-bearing claims (roles, clearance_level, user_id, department) are NEVER accepted
     from arbitrary caller request fields.
-    Checks:
-    1. X-API-Key header (via Security scheme)
-    2. Authorization: Bearer <key> header (via Security scheme)
-    3. api_key query parameter
-    4. JSON body 'api_key' field (if application/json)
+
+    In production:
+    - Accepts credentials EXCLUSIVELY via standard headers:
+      1. X-API-Key header (via Security scheme)
+      2. Authorization: Bearer <key> header (via Security scheme)
+    - Rejects credentials submitted in URL query parameters (?api_key=...) or JSON bodies ({"api_key": ...})
+      with HTTP 400 Bad Request to prevent credential leakage in access logs, browser history, and traces.
     """
     expected = os.environ.get("RAG_API_KEY", "").strip() or None
     allow_builtin = are_builtin_tokens_allowed()
+    strict_header_auth = is_strict_header_auth_enforced()
 
+    # 1. Enforce strict transport security in production: reject query parameters and body credentials
+    if strict_header_auth:
+        if bool(request.query_params.get("api_key")):
+            logger.warning(
+                "[Security Audit] Rejected request with credentials in URL query parameter under strict production auth policy."
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Insecure credential transmission: Passing API credentials in URL query parameters is prohibited in production. Provide credentials exclusively via 'Authorization: Bearer <key>' or 'X-API-Key' headers."
+            )
+
+        if request.headers.get("content-type", "").startswith("application/json"):
+            try:
+                body = await request.json()
+                if isinstance(body, dict) and bool(body.get("api_key")):
+                    logger.warning(
+                        "[Security Audit] Rejected request with credentials in JSON request body under strict production auth policy."
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Insecure credential transmission: Passing API credentials in request body is prohibited in production. Provide credentials exclusively via 'Authorization: Bearer <key>' or 'X-API-Key' headers."
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+
+    # 2. Extract credential exclusively from headers (or fallback to legacy transport if non-prod/relaxed)
     provided = header_key or request.headers.get("X-API-Key")
     if not provided and bearer_token:
         provided = bearer_token.credentials
@@ -181,25 +282,24 @@ async def get_current_principal(
         if auth_header.startswith("Bearer "):
             provided = auth_header.replace("Bearer ", "").strip()
 
-    if not provided:
+    if not provided and not strict_header_auth:
         provided = request.query_params.get("api_key")
+        if not provided and request.headers.get("content-type", "").startswith("application/json"):
+            try:
+                body = await request.json()
+                if isinstance(body, dict):
+                    provided = body.get("api_key")
+            except Exception:
+                pass
 
-    if not provided and request.headers.get("content-type", "").startswith("application/json"):
-        try:
-            body = await request.json()
-            if isinstance(body, dict):
-                provided = body.get("api_key")
-        except Exception:
-            pass
-
-    # 1. If a credential was provided:
+    # 3. If a credential was provided:
     if provided:
         # Block built-in development credentials when production authentication is enforced
         if principal_registry.is_builtin_token(provided):
             if not allow_builtin:
                 logger.warning(
-                    f"[Security Audit] Blocked attempt to authenticate with built-in development token '{provided}' "
-                    f"while production authentication is enforced."
+                    "[Security Audit] Blocked attempt to authenticate with built-in development token '[REDACTED]' "
+                    "while production authentication is enforced."
                 )
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
@@ -231,15 +331,15 @@ async def get_current_principal(
                     headers={"WWW-Authenticate": "Bearer"},
                 )
 
-    # 2. When RAG_API_KEY is configured in the environment and no credential was provided:
+    # 4. When RAG_API_KEY is configured in the environment and no credential was provided:
     if expected:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized: Invalid or missing API key.",
+            detail="Unauthorized: Invalid or missing API key. Provide credentials via 'Authorization: Bearer <key>' or 'X-API-Key' headers.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # 3. Open Developer Mode: When RAG_API_KEY is unset and no valid credential was provided
+    # 5. Open Developer Mode: When RAG_API_KEY is unset and no valid credential was provided
     return principal_registry.get_default_developer_principal()
 
 

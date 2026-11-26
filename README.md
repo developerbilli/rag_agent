@@ -206,3 +206,18 @@ The file upload endpoint (`POST /upload`) enforces defense-in-depth protections 
 | `RAG_MAX_REQUEST_UPLOAD_SIZE` | `52428800` (50 MB) | Maximum cumulative uploaded file size per request |
 | `RAG_MAX_REQUEST_BODY_SIZE` | `57671680` (55 MB) | Maximum HTTP request body limit (Content-Length check) |
 | `RAG_UPLOAD_CHUNK_SIZE` | `65536` (64 KB) | Streaming chunk size for bounded asynchronous file reading |
+
+---
+
+## 🔐 Authentication & Transport Security
+
+In production environments (`RAG_API_KEY` configured or `RAG_ENV=production`), the pipeline enforces strict header-only authentication to protect against credential leaks in access logs, browser history, and monitoring traces:
+
+- **Accepted Headers**:
+  - `Authorization: Bearer <token>`
+  - `X-API-Key: <token>`
+- **Rejected Transport Schemes**:
+  - URL query parameters (`?api_key=...`) are rejected with HTTP 400 Bad Request.
+  - JSON body fields (`{"api_key": ...}`) are rejected with HTTP 400 Bad Request.
+- **Automated Log Redaction**:
+  - `SensitiveHeaderRedactionFilter` automatically masks Bearer tokens, `X-API-Key` headers, and credential query strings across all system loggers, replacing sensitive tokens with `[REDACTED]`.

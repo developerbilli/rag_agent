@@ -331,5 +331,26 @@ rag.internal.company.com {
 
 ---
 
+## Production Security: Strict Header Authentication & Authorization Log Redaction
+
+In production environments, credentials transmitted via URL query strings or JSON request bodies represent severe data leakage risks:
+- **URL Query Parameters** (`?api_key=...`): Captured in reverse proxy access logs (Nginx/Apache), browser history, monitoring traces, APM tools (Datadog/NewRelic), and copied URLs.
+- **JSON Request Bodies** (`{"api_key": ...}`): Complicate request parsing and risk exposure in error tracing or payload dumps.
+
+### Implementation Safeguards (`main.py`):
+1. **Header-Only Authentication**:
+   - In production (`RAG_API_KEY` configured or `RAG_ENV=production`), callers must authenticate exclusively through dedicated headers:
+     - `Authorization: Bearer <token>`
+     - `X-API-Key: <token>`
+2. **Strict Query/Body Rejection**:
+   - Requests attempting to pass `api_key` via URL query parameters or JSON bodies are immediately rejected with HTTP `400 Bad Request` explaining the policy violation.
+   - Even if a valid header is also provided, presence of query parameter credentials triggers rejection to prevent URL-based credential exposure.
+3. **Automated Log Redaction (`SensitiveHeaderRedactionFilter`)**:
+   - Global logging filter installed on `logger`, root logger, Uvicorn, and ASGI servers.
+   - Automatically sanitizes Bearer tokens, `X-API-Key` values, authorization headers, and query parameters, replacing secrets with `[REDACTED]`.
+   - Utility `redact_headers(dict)` strips sensitive header values prior to structured logging or debugging.
+
+---
+
 ## Conclusion
 Our project architecture provides concrete, production-grade implementations for each of these 10 areas, balancing lightweight local edge constraints (running smoothly on Apple Silicon with 16 GB RAM) with enterprise-level robustness.
