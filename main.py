@@ -195,9 +195,15 @@ def get_auth_mode() -> str:
     Resolves the active authentication mode ('development' or 'production').
     Configured explicitly via RAG_AUTH_MODE=development|production.
     
-    If RAG_AUTH_MODE is unset, falls back to RAG_ENV or ENVIRONMENT if set to 'production'/'prod',
-    otherwise defaults to 'development' for local developer convenience.
+    Hard Security Boundary:
+    If RAG_ENV or ENVIRONMENT is set to 'production' or 'prod', production mode
+    is strictly enforced and CANNOT be downgraded to 'development' by RAG_AUTH_MODE.
     """
+    is_prod_env = os.environ.get("RAG_ENV", "").strip().lower() in ("production", "prod") or \
+                  os.environ.get("ENVIRONMENT", "").strip().lower() in ("production", "prod")
+    if is_prod_env:
+        return "production"
+
     raw_mode = os.environ.get("RAG_AUTH_MODE", "").strip().lower()
     if raw_mode in ("production", "prod"):
         return "production"
@@ -206,11 +212,6 @@ def get_auth_mode() -> str:
     if raw_mode:
         raise ValueError(f"Invalid RAG_AUTH_MODE '{raw_mode}'. Expected 'development' or 'production'.")
 
-    # If RAG_AUTH_MODE is not explicitly specified, check RAG_ENV / ENVIRONMENT
-    is_prod_env = os.environ.get("RAG_ENV", "").strip().lower() in ("production", "prod") or \
-                  os.environ.get("ENVIRONMENT", "").strip().lower() in ("production", "prod")
-    if is_prod_env:
-        return "production"
     return "development"
 
 
@@ -231,14 +232,30 @@ def validate_auth_configuration() -> None:
     """
     Startup authentication validator.
     In production mode (RAG_AUTH_MODE=production or production environment):
-    1. Fails startup if no authentication configuration exists (e.g. RAG_API_KEY is absent).
-    2. Fails startup if development-only bypass flags are enabled:
+    1. Fails startup if attempting to downgrade a production environment to development mode.
+    2. Fails startup if no authentication configuration exists (e.g. RAG_API_KEY is absent).
+    3. Fails startup if development-only bypass flags are enabled:
        - RAG_ALLOW_BUILTIN_TOKENS=true
        - RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT=true
     """
+    is_prod_env = os.environ.get("RAG_ENV", "").strip().lower() in ("production", "prod") or \
+                  os.environ.get("ENVIRONMENT", "").strip().lower() in ("production", "prod")
+    raw_auth_mode = os.environ.get("RAG_AUTH_MODE", "").strip().lower()
+
+    # 1. Hard Security Boundary: Prohibit downgrading a production environment
+    if is_prod_env and raw_auth_mode in ("development", "dev", "local", "test"):
+        err_msg = (
+            f"Production startup failed: Attempted to downgrade production environment "
+            f"(RAG_ENV/ENVIRONMENT='{os.environ.get('RAG_ENV') or os.environ.get('ENVIRONMENT')}') "
+            f"to development mode (RAG_AUTH_MODE='{raw_auth_mode}'). "
+            f"Production environment is a hard security boundary that cannot be downgraded."
+        )
+        logger.critical(f"[Security Startup Violation] {err_msg}")
+        raise RuntimeError(err_msg)
+
     auth_mode = get_auth_mode()
     if auth_mode == "production":
-        # 1. Require authoritative authentication configuration
+        # 2. Require authoritative authentication configuration
         if not has_auth_configuration():
             err_msg = (
                 "Production startup failed: RAG_AUTH_MODE is set to 'production' "
@@ -250,7 +267,7 @@ def validate_auth_configuration() -> None:
             logger.critical(f"[Security Startup Violation] {err_msg}")
             raise RuntimeError(err_msg)
 
-        # 2. Development overrides cannot weaken production security
+        # 3. Development overrides cannot weaken production security
         if os.environ.get("RAG_ALLOW_BUILTIN_TOKENS", "").strip().lower() in ("true", "1", "yes"):
             err_msg = (
                 "Production startup failed: RAG_ALLOW_BUILTIN_TOKENS is enabled while in production mode. "

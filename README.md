@@ -214,6 +214,7 @@ The file upload endpoint (`POST /upload`) enforces defense-in-depth protections 
 The pipeline provides configurable authentication modes via `RAG_AUTH_MODE=development|production`:
 
 - **Production Mode (`RAG_AUTH_MODE=production` or `RAG_ENV=production`)**:
+  - **Hard Security Boundary**: If `RAG_ENV` or `ENVIRONMENT` indicates production, the environment cannot be downgraded to `development` by setting `RAG_AUTH_MODE=development`. Any downgrade attempt immediately fails startup with `RuntimeError` (fail-closed).
   - **Fail-Fast Startup**: If `RAG_API_KEY` is not configured, the service fails startup immediately with `RuntimeError`, preventing accidental unauthenticated production deployments.
   - **Zero Open Access**: Unauthenticated requests are rejected with HTTP 401 Unauthorized.
   - **Built-in Token Blocking**: Development credentials (`admin-token`, `user-token`) are strictly blocked.

@@ -373,7 +373,7 @@ In production environments, credentials transmitted via URL query strings or JSO
 1. **Explicit Authentication Mode (`RAG_AUTH_MODE=development|production`)**:
    - `RAG_AUTH_MODE=production`: Open developer mode is completely disabled. Startup validator `validate_auth_configuration()` enforces that `RAG_API_KEY` (or custom server credentials) is configured; if missing, server startup immediately halts with `RuntimeError`. All unauthenticated requests are strictly rejected with HTTP 401.
    - `RAG_AUTH_MODE=development`: Permits local development without an API key under a restricted default user principal (`dev_user`, role: `user`).
-   - If unset, production mode is automatically inferred if `RAG_ENV=production` or `ENVIRONMENT=production`.
+   - **Hard Security Boundary**: If `RAG_ENV=production` or `ENVIRONMENT=production`, production mode is strictly enforced and CANNOT be downgraded by `RAG_AUTH_MODE=development`. Attempting to set `RAG_AUTH_MODE=development` in a production environment causes `validate_auth_configuration()` to raise `RuntimeError` immediately (fail-closed startup).
 2. **Header-Only Authentication**:
    - In production (`RAG_AUTH_MODE=production` or `RAG_API_KEY` configured), callers must authenticate exclusively through dedicated headers:
      - `Authorization: Bearer <token>`

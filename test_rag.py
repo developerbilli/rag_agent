@@ -6163,6 +6163,29 @@ class TestAuthModeAndStartupValidation(unittest.TestCase):
         res_valid = client.get("/documents", headers={"Authorization": "Bearer prod-secret-key-12345"})
         self.assertEqual(res_valid.status_code, 200)
 
+    def test_production_environment_cannot_be_downgraded(self):
+        """Hard security boundary: RAG_ENV=production cannot be downgraded by RAG_AUTH_MODE=development."""
+        os.environ["RAG_ENV"] = "production"
+        os.environ["RAG_AUTH_MODE"] = "development"
+        os.environ.pop("RAG_API_KEY", None)
+
+        self.assertEqual(self.get_auth_mode(), "production")
+        with self.assertRaises(RuntimeError) as cm:
+            self.validate_auth_configuration()
+        self.assertIn("Production startup failed", str(cm.exception))
+
+    def test_environment_variable_cannot_be_downgraded(self):
+        """Hard security boundary: ENVIRONMENT=prod cannot be downgraded by RAG_AUTH_MODE=development."""
+        os.environ.pop("RAG_ENV", None)
+        os.environ["ENVIRONMENT"] = "prod"
+        os.environ["RAG_AUTH_MODE"] = "development"
+        os.environ.pop("RAG_API_KEY", None)
+
+        self.assertEqual(self.get_auth_mode(), "production")
+        with self.assertRaises(RuntimeError) as cm:
+            self.validate_auth_configuration()
+        self.assertIn("Production startup failed", str(cm.exception))
+
 
 class TestIngestionRBACAndDocumentOwnership(unittest.TestCase):
     """
