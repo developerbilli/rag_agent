@@ -4296,5 +4296,145 @@ class TestServerSideAuthorizationAndIdentityIntegrity(unittest.TestCase):
         self.assertEqual(safe_ctx["safe_search_param"], "strict")
 
 
+class TestCrossDepartmentCacheIsolationAndReauthorization(unittest.TestCase):
+    """
+    Security verification tests proving that query-cache keys incorporate the department
+    authorization attribute, and that defense-in-depth re-authorization prevents
+    cross-department and cross-clearance data leakage even on cache lookups.
+    """
+
+    def setUp(self):
+        self.indexer = VectorIndexer(model_name="all-MiniLM-L6-v2")
+        self.chunker = TextChunker(chunk_size=100, overlap=20)
+        self.indexer.clear()
+
+        # 1. Engineering document (department restricted)
+        self.indexer.stage_and_commit_document(
+            doc_id="doc_eng",
+            text="Proprietary compiler optimization internals and kernel telemetry.",
+            title="Engineering Telemetry",
+            chunker=self.chunker,
+            metadata={
+                "department": "engineering",
+                "department_restricted": True,
+                "clearance_level": "internal"
+            }
+        )
+
+        # 2. Finance document (department restricted)
+        self.indexer.stage_and_commit_document(
+            doc_id="doc_fin",
+            text="Confidential fiscal quarterly EBITDA margin and burn rate details.",
+            title="Finance EBITDA",
+            chunker=self.chunker,
+            metadata={
+                "department": "finance",
+                "department_restricted": True,
+                "clearance_level": "internal"
+            }
+        )
+
+    def test_cache_01_cross_department_cache_keys_are_disjoint(self):
+        """Cache keys differ when department differs, even if query, top_k, user_id, roles, and clearance are identical."""
+        ctx_eng = {
+            "user_id": "analyst_1",
+            "roles": ["analyst"],
+            "clearance_level": "internal",
+            "department": "engineering"
+        }
+        ctx_fin = {
+            "user_id": "analyst_1",
+            "roles": ["analyst"],
+            "clearance_level": "internal",
+            "department": "finance"
+        }
+        gen = self.indexer.get_current_generation()
+        key_eng = self.indexer.retrieval_cache._make_key("quarterly telemetry", top_k=3, filters=None, user_context=ctx_eng, generation=gen)
+        key_fin = self.indexer.retrieval_cache._make_key("quarterly telemetry", top_k=3, filters=None, user_context=ctx_fin, generation=gen)
+
+        self.assertNotEqual(key_eng, key_fin, "Cache keys for different departments must be distinct to prevent cross-department data reuse!")
+
+    def test_cache_02_department_restricted_chunk_not_leaked_via_cache(self):
+        """
+        User A in finance queries and populates cache.
+        User B with same user_id/roles/clearance in engineering queries same terms.
+        Cached finance data must NOT leak to engineering user!
+        """
+        ctx_fin = {
+            "user_id": "user_shared",
+            "roles": ["analyst"],
+            "clearance_level": "internal",
+            "department": "finance"
+        }
+        ctx_eng = {
+            "user_id": "user_shared",
+            "roles": ["analyst"],
+            "clearance_level": "internal",
+            "department": "engineering"
+        }
+
+        # Query 1: Finance user retrieves and caches finance document
+        res_fin = self.indexer.search("fiscal quarterly EBITDA", top_k=3, user_context=ctx_fin)
+        self.assertTrue(any(c["doc_id"] == "doc_fin" for c in res_fin))
+
+        # Query 2: Engineering user queries identical query string
+        res_eng = self.indexer.search("fiscal quarterly EBITDA", top_k=3, user_context=ctx_eng)
+        # Must NOT leak doc_fin!
+        self.assertFalse(any(c["doc_id"] == "doc_fin" for c in res_eng))
+
+    def test_cache_03_defense_in_depth_reauthorization_blocks_tampered_cache_hit(self):
+        """
+        If a cache entry containing department-restricted chunks is accessed by a different department,
+        defense-in-depth re-authorization catches the mismatch, evicts the entry, and returns None.
+        """
+        ctx_fin = {"user_id": "u1", "roles": ["user"], "clearance_level": "internal", "department": "finance"}
+        ctx_eng = {"user_id": "u1", "roles": ["user"], "clearance_level": "internal", "department": "engineering"}
+        gen = self.indexer.get_current_generation()
+
+        # Artificially store finance chunks under key_eng
+        key_eng = self.indexer.retrieval_cache._make_key("compiler telemetry", top_k=2, filters=None, user_context=ctx_eng, generation=gen)
+        fin_chunks = [
+            {
+                "chunk_id": "f1",
+                "doc_id": "doc_fin",
+                "text": "Secret EBITDA",
+                "department": "finance",
+                "department_restricted": True,
+                "clearance_level": "internal"
+            }
+        ]
+        self.indexer.retrieval_cache.cache_result(key_eng, fin_chunks, query_generation=gen)
+
+        # Attempt to read cached entry with engineering context
+        hit = self.indexer.retrieval_cache.get("compiler telemetry", top_k=2, filters=None, user_context=ctx_eng, generation=gen)
+        # Defense-in-depth re-authorization must detect the department mismatch, evict key, and return None
+        self.assertIsNone(hit)
+        self.assertNotIn(key_eng, self.indexer.retrieval_cache._cache)
+
+    def test_cache_04_hybrid_search_respects_department_cache_isolation(self):
+        """Hybrid RRF search caches and re-authorizes department isolation correctly."""
+        ctx_fin = {"user_id": "u2", "roles": ["user"], "clearance_level": "internal", "department": "finance"}
+        ctx_eng = {"user_id": "u2", "roles": ["user"], "clearance_level": "internal", "department": "engineering"}
+
+        # Search hybrid as finance
+        res_fin = self.indexer.search_hybrid("quarterly EBITDA", top_k=3, user_context=ctx_fin)
+        self.assertTrue(any(c["doc_id"] == "doc_fin" for c in res_fin))
+
+        # Search hybrid as engineering
+        res_eng = self.indexer.search_hybrid("quarterly EBITDA", top_k=3, user_context=ctx_eng)
+        self.assertFalse(any(c["doc_id"] == "doc_fin" for c in res_eng))
+
+    def test_cache_05_authenticated_principal_department_isolation(self):
+        """AuthenticatedPrincipal objects maintain complete cache isolation across departments."""
+        p_eng = AuthenticatedPrincipal(principal_id="alice", roles=["engineer"], clearance_level="internal", department="engineering")
+        p_fin = AuthenticatedPrincipal(principal_id="bob", roles=["accountant"], clearance_level="internal", department="finance")
+
+        res_eng = self.indexer.search("compiler optimization internals", top_k=2, user_context=p_eng)
+        self.assertTrue(any(c["doc_id"] == "doc_eng" for c in res_eng))
+
+        res_fin = self.indexer.search("compiler optimization internals", top_k=2, user_context=p_fin)
+        self.assertFalse(any(c["doc_id"] == "doc_eng" for c in res_fin))
+
+
 if __name__ == "__main__":
     unittest.main()

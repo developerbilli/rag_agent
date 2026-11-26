@@ -1052,13 +1052,29 @@ class RetrievalCache:
         self.ttl_seconds = ttl_seconds
         self.generation_fn = generation_fn
 
-    def _make_key(self, query: str, top_k: int, filters: Optional[Dict], user_context: Optional[Dict], generation: int) -> str:
+    def _make_key(self, query: str, top_k: int, filters: Optional[Dict], user_context: Optional[Any], generation: int) -> str:
+        """
+        Constructs a cryptographically secure cache key incorporating:
+        - Query string and Top-K limit
+        - Filter expression
+        - Full authorization context (user_id, clearance_level, roles, department, auth_source)
+        - Index generation version
+        Guarantees that cross-department or cross-clearance contexts hash to disjoint cache keys.
+        """
         import hashlib
         f_str = json.dumps(filters, sort_keys=True) if filters else ""
         u_str = ""
         if user_context:
-            roles = ",".join(sorted(str(r) for r in user_context.get("roles", [])))
-            u_str = f"{user_context.get('user_id', '')}:{user_context.get('clearance_level', '')}:{roles}"
+            if hasattr(user_context, "to_user_context"):
+                uc = user_context.to_user_context()
+            else:
+                uc = user_context
+            u_id = str(uc.get("user_id", "") or "").strip()
+            clearance = str(uc.get("clearance_level", "public") or "public").strip().lower()
+            dept = str(uc.get("department", "") or "").strip().lower()
+            roles = ",".join(sorted(str(r).strip().lower() for r in uc.get("roles", [])))
+            auth_src = str(uc.get("auth_source", "") or "").strip().lower()
+            u_str = f"uid:{u_id}|clr:{clearance}|dpt:{dept}|roles:{roles}|src:{auth_src}"
         raw = f"q:{query.strip().lower()}|k:{top_k}|f:{f_str}|u:{u_str}|gen:{generation}"
         return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
@@ -1067,7 +1083,7 @@ class RetrievalCache:
         query: str,
         top_k: int,
         filters: Optional[Dict],
-        user_context: Optional[Dict],
+        user_context: Optional[Any],
         generation: int,
         current_generation: Optional[int] = None,
         deleted_doc_ids: Optional[Set[str]] = None
@@ -1113,11 +1129,24 @@ class RetrievalCache:
                 except Exception:
                     pass
                 return None
+
+            # Defense-in-depth: Re-authorize every cached result against the requesting user_context and filters
+            raw_results = entry.get("results", [])
+            for c in raw_results:
+                if not MetadataFilterEngine.matches(c, filter_expr=filters, user_context=user_context, include_deleted=False):
+                    # Authorization violation detected on cached chunk: evict and return None to force fresh authorized retrieval
+                    self._evict_key(key)
+                    try:
+                        OperationalObservabilityDashboard.get_instance().record_cache_event(False)
+                    except Exception:
+                        pass
+                    return None
+
             try:
                 OperationalObservabilityDashboard.get_instance().record_cache_event(True)
             except Exception:
                 pass
-            return [dict(c) for c in entry["results"]]
+            return [dict(c) for c in raw_results]
 
     def set(
         self,
@@ -1206,12 +1235,14 @@ class RetrievalCache:
         self,
         key: str,
         current_generation: Optional[int] = None,
-        deleted_doc_ids: Optional[Set[str]] = None
+        deleted_doc_ids: Optional[Set[str]] = None,
+        user_context: Optional[Any] = None,
+        filters: Optional[Dict] = None
     ) -> Optional[List[Dict[str, Any]]]:
         """
-        Reads a cached entry with generation validation.
-        If the cached entry's generation differs from current_generation or references deleted documents,
-        it is evicted as stale.
+        Reads a cached entry with generation validation and defense-in-depth authorization.
+        If the cached entry's generation differs from current_generation, references deleted documents,
+        or fails re-authorization against user_context, it is evicted as stale.
         """
         active_gen = current_generation
         if active_gen is None and self.generation_fn:
@@ -1230,6 +1261,15 @@ class RetrievalCache:
             if deleted_doc_ids and any(d in deleted_doc_ids for d in entry.get("doc_ids", set())):
                 self._evict_key(key)
                 return None
+
+            # Defense-in-depth: Re-authorize cached chunks if user_context is provided
+            if user_context is not None:
+                raw_results = entry.get("results", [])
+                for c in raw_results:
+                    if not MetadataFilterEngine.matches(c, filter_expr=filters, user_context=user_context, include_deleted=False):
+                        self._evict_key(key)
+                        return None
+
             return [dict(c) if isinstance(c, dict) else c for c in entry["results"]]
 
     def invalidate_document(self, doc_id: str) -> int:
@@ -1460,11 +1500,16 @@ class VectorIndexer:
             )
         return False
 
-    def get_cached_result(self, key: str) -> Optional[List[Dict[str, Any]]]:
+    def get_cached_result(
+        self,
+        key: str,
+        user_context: Optional[Any] = None,
+        filters: Optional[Dict] = None
+    ) -> Optional[List[Dict[str, Any]]]:
         """
-        Reads cached result with thread-safe generation validation.
-        Validates generation at cache read time, evicting entries that do not match active generation
-        or reference soft-deleted documents.
+        Reads cached result with thread-safe generation validation and defense-in-depth re-authorization.
+        Validates generation at cache read time, evicting entries that do not match active generation,
+        reference soft-deleted documents, or fail user_context authorization.
         """
         if hasattr(self, 'retrieval_cache') and self.retrieval_cache is not None:
             deleted_docs = {
@@ -1474,7 +1519,9 @@ class VectorIndexer:
             return self.retrieval_cache.get_cached_result(
                 key=key,
                 current_generation=self.get_current_generation(),
-                deleted_doc_ids=deleted_docs
+                deleted_doc_ids=deleted_docs,
+                user_context=user_context,
+                filters=filters
             )
         return None
 
