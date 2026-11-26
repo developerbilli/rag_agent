@@ -1936,6 +1936,42 @@ class VectorIndexer:
 
         return results
 
+    @staticmethod
+    def _build_hybrid_cache_key(
+        query: str,
+        alpha: float = 0.5,
+        weight_dense: Optional[float] = None,
+        weight_bm25: Optional[float] = None,
+        rrf_k: int = 60,
+        candidate_multiplier: int = 5,
+        use_reranker: Union[bool, str] = False
+    ) -> str:
+        """
+        Builds a canonical cache key incorporating all ranking-affecting parameters:
+        - Query string
+        - Alpha parameter
+        - Explicit dense and BM25 weights (weight_dense, weight_bm25)
+        - Effective dense and BM25 weights (w_dense, w_bm25)
+        - RRF smoothing constant (rrf_k)
+        - Candidate multiplier pool size (candidate_multiplier)
+        - Cross-encoder reranker choice (use_reranker)
+        Guarantees disjoint cache identities when ranking weights or candidate multipliers differ.
+        """
+        w_dense = weight_dense if weight_dense is not None else alpha
+        w_bm25 = weight_bm25 if weight_bm25 is not None else (1.0 - alpha)
+        reranker_tag = str(use_reranker).strip().lower() if use_reranker is not None else "false"
+        return (
+            f"hybrid:{query.strip().lower()}:"
+            f"a={alpha}:"
+            f"wd={weight_dense}:"
+            f"wb={weight_bm25}:"
+            f"ewd={w_dense:.4f}:"
+            f"ewb={w_bm25:.4f}:"
+            f"rrf={rrf_k}:"
+            f"cm={candidate_multiplier}:"
+            f"rerank={reranker_tag}"
+        )
+
     def search_hybrid(
         self,
         query: str,
@@ -1966,10 +2002,21 @@ class VectorIndexer:
             if v.get("status") == "deleted" or bool(v.get("deleted"))
         }
 
+        w_dense = weight_dense if weight_dense is not None else alpha
+        w_bm25 = weight_bm25 if weight_bm25 is not None else (1.0 - alpha)
+
         # 0. Check retrieval cache with active generation validation and deleted doc eviction
         gen = snap.generation
         active_gen = self.get_current_generation()
-        cache_key = f"hybrid:{query}:a={alpha}:rrf={rrf_k}:rerank={use_reranker}"
+        cache_key = self._build_hybrid_cache_key(
+            query=query,
+            alpha=alpha,
+            weight_dense=weight_dense,
+            weight_bm25=weight_bm25,
+            rrf_k=rrf_k,
+            candidate_multiplier=candidate_multiplier,
+            use_reranker=use_reranker
+        )
         if hasattr(self, 'retrieval_cache') and self.retrieval_cache is not None:
             cached = self.retrieval_cache.get(
                 cache_key, top_k, filters, user_context, gen,
@@ -1990,9 +2037,6 @@ class VectorIndexer:
                 return []
         else:
             valid_set = None
-
-        w_dense = weight_dense if weight_dense is not None else alpha
-        w_bm25 = weight_bm25 if weight_bm25 is not None else (1.0 - alpha)
 
         # 1. Dense retrieval (filtered candidates) bound to exact same snapshot view
         pool_size = len(valid_set) if valid_set is not None else len(snap.chunks)

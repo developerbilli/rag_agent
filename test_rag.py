@@ -4961,5 +4961,133 @@ class TestCanonicalLifecycleIngestionIntegrity(unittest.TestCase):
         self.assertEqual(len(result_chunk_ids), len(set(result_chunk_ids)), "Hybrid search results must contain unique chunk IDs")
 
 
+class TestHybridRetrievalCacheKeyIsolation(unittest.TestCase):
+    """
+    Test suite verifying that the hybrid retrieval cache key includes all ranking-affecting parameters:
+    - weight_dense and weight_bm25 (both explicit and effective weights)
+    - candidate_multiplier
+    - alpha and rrf_k
+    - use_reranker choices (boolean vs heuristic)
+    Guarantees that varying any ranking parameter produces a distinct cache identity
+    and does not return cached rankings produced under a different configuration.
+    """
+
+    def setUp(self):
+        from rag_core import VectorIndexer, TextChunker
+        self.indexer = VectorIndexer(model_name="tfidf-sklearn")
+        self.chunker = TextChunker(chunk_size=120, overlap=20)
+
+        # Ingest documents:
+        # doc_lexical: has exact repeated keyword matches for "kubernetes container pods"
+        # doc_semantic: has related architectural terms "containerized cloud orchestrator microservices"
+        self.indexer.stage_and_commit_document(
+            doc_id="doc_lexical",
+            text="kubernetes container pods kubernetes pods kubernetes container deployment nodes.",
+            title="Lexical Doc",
+            chunker=self.chunker
+        )
+        self.indexer.stage_and_commit_document(
+            doc_id="doc_semantic",
+            text="Containerized application clusters orchestrate microservices, network namespaces, and services.",
+            title="Semantic Doc",
+            chunker=self.chunker
+        )
+
+    def test_hybrid_cache_01_canonical_key_construction_incorporates_all_parameters(self):
+        """Verifies VectorIndexer._build_hybrid_cache_key incorporates all ranking parameters."""
+        k_base = self.indexer._build_hybrid_cache_key("test query", alpha=0.5, weight_dense=None, weight_bm25=None, rrf_k=60, candidate_multiplier=5, use_reranker=False)
+
+        # Different weight_dense
+        k_wd = self.indexer._build_hybrid_cache_key("test query", alpha=0.5, weight_dense=0.9, weight_bm25=None, rrf_k=60, candidate_multiplier=5, use_reranker=False)
+        self.assertNotEqual(k_base, k_wd, "Explicit weight_dense must produce distinct cache key")
+
+        # Different weight_bm25
+        k_wb = self.indexer._build_hybrid_cache_key("test query", alpha=0.5, weight_dense=None, weight_bm25=0.8, rrf_k=60, candidate_multiplier=5, use_reranker=False)
+        self.assertNotEqual(k_base, k_wb, "Explicit weight_bm25 must produce distinct cache key")
+
+        # Different candidate_multiplier
+        k_cm = self.indexer._build_hybrid_cache_key("test query", alpha=0.5, weight_dense=None, weight_bm25=None, rrf_k=60, candidate_multiplier=10, use_reranker=False)
+        self.assertNotEqual(k_base, k_cm, "candidate_multiplier must produce distinct cache key")
+
+        # Different rrf_k
+        k_rrf = self.indexer._build_hybrid_cache_key("test query", alpha=0.5, weight_dense=None, weight_bm25=None, rrf_k=20, candidate_multiplier=5, use_reranker=False)
+        self.assertNotEqual(k_base, k_rrf, "rrf_k must produce distinct cache key")
+
+        # Different reranker
+        k_rerank = self.indexer._build_hybrid_cache_key("test query", alpha=0.5, weight_dense=None, weight_bm25=None, rrf_k=60, candidate_multiplier=5, use_reranker="heuristic")
+        self.assertNotEqual(k_base, k_rerank, "use_reranker must produce distinct cache key")
+
+        # Identical parameters produce identical key
+        k_same = self.indexer._build_hybrid_cache_key("test query", alpha=0.5, weight_dense=None, weight_bm25=None, rrf_k=60, candidate_multiplier=5, use_reranker=False)
+        self.assertEqual(k_base, k_same, "Identical ranking parameters must produce identical cache key")
+
+    def test_hybrid_cache_02_weight_changes_produce_cache_miss_and_different_rankings(self):
+        """Varying weight_dense and weight_bm25 bypasses previous cached rankings."""
+        query = "kubernetes container pods"
+
+        # Search with BM25 heavily weighted (BM25 = 1.0, Dense = 0.0)
+        res_bm25_heavy = self.indexer.search_hybrid(
+            query=query,
+            top_k=2,
+            weight_dense=0.0,
+            weight_bm25=1.0
+        )
+        self.assertGreater(len(res_bm25_heavy), 0)
+        self.assertEqual(res_bm25_heavy[0]["doc_id"], "doc_lexical")
+
+        # Search with Dense heavily weighted (Dense = 1.0, BM25 = 0.0)
+        res_dense_heavy = self.indexer.search_hybrid(
+            query=query,
+            top_k=2,
+            weight_dense=1.0,
+            weight_bm25=0.0
+        )
+        self.assertGreater(len(res_dense_heavy), 0)
+
+        # In cache, there must be two distinct entries, not one overwritten/reused entry
+        cache_dict = self.indexer.retrieval_cache._cache
+        self.assertGreaterEqual(len(cache_dict), 2, "Cache must store distinct entries for distinct ranking weights")
+
+    def test_hybrid_cache_03_candidate_multiplier_difference_yields_independent_cache(self):
+        """Varying candidate_multiplier produces distinct cache keys."""
+        query = "containerized clusters"
+
+        self.indexer.search_hybrid(query, top_k=2, candidate_multiplier=2)
+        count_after_first = len(self.indexer.retrieval_cache._cache)
+
+        self.indexer.search_hybrid(query, top_k=2, candidate_multiplier=8)
+        count_after_second = len(self.indexer.retrieval_cache._cache)
+
+        self.assertEqual(count_after_second, count_after_first + 1, "Changing candidate_multiplier must create a separate cache entry")
+
+    def test_hybrid_cache_04_reranker_mode_difference_yields_independent_cache(self):
+        """Enabling reranker produces distinct cache keys from un-reranked hybrid search."""
+        query = "network namespaces"
+
+        res_no_rerank = self.indexer.search_hybrid(query, top_k=2, use_reranker=False)
+        self.assertEqual(res_no_rerank[0].get("modality"), "rrf")
+
+        res_rerank = self.indexer.search_hybrid(query, top_k=2, use_reranker="heuristic")
+        self.assertEqual(res_rerank[0].get("modality"), "reranker")
+
+        # Ensure both are cached independently
+        cache_entries = self.indexer.retrieval_cache._cache.values()
+        modalities = {c["results"][0].get("modality") for c in cache_entries if c["results"]}
+        self.assertIn("rrf", modalities)
+        self.assertIn("reranker", modalities)
+
+    def test_hybrid_cache_05_identical_configuration_returns_cache_hit(self):
+        """Identical ranking configuration reuses cached entry."""
+        query = "application clusters"
+        res1 = self.indexer.search_hybrid(query, top_k=2, weight_dense=0.6, weight_bm25=0.4, candidate_multiplier=3)
+        entries_before = len(self.indexer.retrieval_cache._cache)
+
+        res2 = self.indexer.search_hybrid(query, top_k=2, weight_dense=0.6, weight_bm25=0.4, candidate_multiplier=3)
+        entries_after = len(self.indexer.retrieval_cache._cache)
+
+        self.assertEqual(entries_before, entries_after, "Identical ranking parameters must hit cache without adding new entry")
+        self.assertEqual([r["chunk_id"] for r in res1], [r["chunk_id"] for r in res2])
+
+
 if __name__ == "__main__":
     unittest.main()
