@@ -59,6 +59,29 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 principal_registry = PrincipalRegistry()
 
+def is_production_auth_configured() -> bool:
+    """Checks whether production authentication is configured."""
+    has_api_key = bool(os.environ.get("RAG_API_KEY", "").strip())
+    is_prod_env = os.environ.get("RAG_ENV", "").strip().lower() in ("production", "prod") or \
+                  os.environ.get("ENVIRONMENT", "").strip().lower() in ("production", "prod")
+    return has_api_key or is_prod_env
+
+
+def are_builtin_tokens_allowed() -> bool:
+    """
+    Built-in development tokens (admin-token, user-token, etc.) are strictly disabled
+    outside explicit test/development mode.
+    When production authentication is configured (RAG_API_KEY set or production environment),
+    built-in credentials are systematically rejected unless RAG_ALLOW_BUILTIN_TOKENS=true.
+    """
+    explicit_allow = os.environ.get("RAG_ALLOW_BUILTIN_TOKENS", "").strip().lower() in ("true", "1", "yes")
+    if explicit_allow:
+        return True
+    if is_production_auth_configured():
+        return False
+    return True
+
+
 async def get_current_principal(
     request: Request,
     header_key: Optional[str] = Security(api_key_header_scheme),
@@ -74,7 +97,8 @@ async def get_current_principal(
     3. api_key query parameter
     4. JSON body 'api_key' field (if application/json)
     """
-    expected = os.environ.get("RAG_API_KEY")
+    expected = os.environ.get("RAG_API_KEY", "").strip() or None
+    allow_builtin = are_builtin_tokens_allowed()
 
     provided = header_key or request.headers.get("X-API-Key")
     if not provided and bearer_token:
@@ -95,32 +119,54 @@ async def get_current_principal(
         except Exception:
             pass
 
-    # 1. Check if token maps directly to an authoritative principal in the server-side registry
+    # 1. If a credential was provided:
     if provided:
-        registered_principal = principal_registry.resolve(provided)
+        # Block built-in development credentials when production authentication is enforced
+        if principal_registry.is_builtin_token(provided):
+            if not allow_builtin:
+                logger.warning(
+                    f"[Security Audit] Blocked attempt to authenticate with built-in development token '{provided}' "
+                    f"while production authentication is enforced."
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Unauthorized: Built-in development credentials are disabled when production authentication is configured.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
+        # Check server-side credential registry (for dynamic / IDP-registered credentials)
+        registered_principal = principal_registry.resolve(provided, allow_builtin=allow_builtin)
         if registered_principal:
             return registered_principal
 
-    # 2. When RAG_API_KEY is configured in the environment:
+        # Check primary configured RAG_API_KEY
+        if expected:
+            if secrets.compare_digest(str(provided), str(expected)):
+                service_roles = [r.strip().lower() for r in os.environ.get("RAG_SERVICE_ROLES", "admin,user").split(",") if r.strip()]
+                service_clearance = os.environ.get("RAG_SERVICE_CLEARANCE", "top_secret").strip().lower()
+                return AuthenticatedPrincipal(
+                    principal_id=os.environ.get("RAG_SERVICE_PRINCIPAL_ID", "primary_service_account"),
+                    roles=service_roles,
+                    clearance_level=service_clearance,
+                    department="system",
+                    auth_source="primary_rag_api_key"
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Unauthorized: Invalid or missing API key.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
+    # 2. When RAG_API_KEY is configured in the environment and no credential was provided:
     if expected:
-        if not provided or not secrets.compare_digest(str(provided), str(expected)):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized: Invalid or missing API key.",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        # Primary service API key maps to authoritative configured service principal
-        service_roles = [r.strip().lower() for r in os.environ.get("RAG_SERVICE_ROLES", "admin,user").split(",") if r.strip()]
-        service_clearance = os.environ.get("RAG_SERVICE_CLEARANCE", "top_secret").strip().lower()
-        return AuthenticatedPrincipal(
-            principal_id=os.environ.get("RAG_SERVICE_PRINCIPAL_ID", "primary_service_account"),
-            roles=service_roles,
-            clearance_level=service_clearance,
-            department="system",
-            auth_source="primary_rag_api_key"
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Invalid or missing API key.",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # 3. Open Developer Mode: When RAG_API_KEY is unset, use default developer principal
+    # 3. Open Developer Mode: When RAG_API_KEY is unset and no valid credential was provided
     return principal_registry.get_default_developer_principal()
 
 

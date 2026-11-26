@@ -769,9 +769,18 @@ class PrincipalRegistry:
     Authoritative Server-Side Identity Directory.
     Maps validated credentials (API keys, Bearer tokens) to authenticated principals.
     Enforces that caller identity and permissions are determined strictly on the server.
+    Distinguishes built-in development credentials from server-registered credentials.
     """
+    BUILTIN_DEV_TOKENS = {
+        "admin-token",
+        "analyst-token",
+        "engineer-token",
+        "user-token"
+    }
+
     def __init__(self):
         self._token_to_principal: Dict[str, AuthenticatedPrincipal] = {}
+        self._builtin_tokens: Set[str] = set(self.BUILTIN_DEV_TOKENS)
         self._init_default_principals()
 
     def _init_default_principals(self):
@@ -784,7 +793,8 @@ class PrincipalRegistry:
                 clearance_level="top_secret",
                 department="security",
                 auth_source="built_in_admin"
-            )
+            ),
+            is_builtin=True
         )
         self.register(
             "analyst-token",
@@ -794,7 +804,8 @@ class PrincipalRegistry:
                 clearance_level="confidential",
                 department="finance",
                 auth_source="built_in_analyst"
-            )
+            ),
+            is_builtin=True
         )
         self.register(
             "engineer-token",
@@ -804,7 +815,8 @@ class PrincipalRegistry:
                 clearance_level="internal",
                 department="engineering",
                 auth_source="built_in_engineer"
-            )
+            ),
+            is_builtin=True
         )
         self.register(
             "user-token",
@@ -814,19 +826,40 @@ class PrincipalRegistry:
                 clearance_level="public",
                 department="general",
                 auth_source="built_in_user"
-            )
+            ),
+            is_builtin=True
         )
 
-    def register(self, token_or_key: str, principal: AuthenticatedPrincipal):
+    def register(self, token_or_key: str, principal: AuthenticatedPrincipal, is_builtin: bool = False):
         if token_or_key and principal:
-            self._token_to_principal[token_or_key.strip()] = principal
+            token = token_or_key.strip()
+            self._token_to_principal[token] = principal
+            if is_builtin:
+                self._builtin_tokens.add(token)
+            else:
+                self._builtin_tokens.discard(token)
 
-    def resolve(self, token_or_key: Optional[str]) -> Optional[AuthenticatedPrincipal]:
+    def is_builtin_token(self, token_or_key: Optional[str]) -> bool:
+        """Determines whether a token is one of the built-in development/testing tokens."""
+        if not token_or_key:
+            return False
+        token = token_or_key.strip()
+        for k in self._builtin_tokens:
+            if secrets.compare_digest(token, k):
+                return True
+        return False
+
+    def resolve(self, token_or_key: Optional[str], allow_builtin: bool = True) -> Optional[AuthenticatedPrincipal]:
+        """Resolves token to principal, rejecting built-in tokens if allow_builtin is False."""
         if not token_or_key:
             return None
         token = token_or_key.strip()
+        if not allow_builtin and self.is_builtin_token(token):
+            return None
         for k, p in self._token_to_principal.items():
             if secrets.compare_digest(token, k):
+                if not allow_builtin and (self.is_builtin_token(k) or getattr(p, "auth_source", "").startswith("built_in_")):
+                    return None
                 return p
         return None
 

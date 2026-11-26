@@ -4638,23 +4638,32 @@ class TestFolderIngestionSecurityAndPathValidation(unittest.TestCase):
         res_unauth = self.client.post("/ingest-folder", json={"folder_path": self.temp_dir})
         self.assertEqual(res_unauth.status_code, 401)
 
-        # Standard user caller (valid auth, but non-admin) is rejected with 403 Forbidden
-        res_user = self.client.post(
+        # Built-in development tokens cannot bypass configured API key (rejected with 401)
+        res_builtin = self.client.post(
             "/ingest-folder",
             json={"folder_path": self.temp_dir},
             headers=self.user_headers
         )
-        self.assertEqual(res_user.status_code, 403)
-        self.assertIn("Administrator authorization required", res_user.json().get("detail", ""))
+        self.assertEqual(res_builtin.status_code, 401)
 
-        # Analyst user caller (valid auth, but non-admin) is also rejected with 403 Forbidden
-        res_analyst = self.client.post(
+        # Valid non-admin principal registered in server credential registry passes authentication but is rejected with 403
+        from main import principal_registry
+        principal_registry.register(
+            "test-registry-nonadmin-token",
+            AuthenticatedPrincipal(
+                principal_id="regular_user",
+                roles=["user"],
+                clearance_level="public",
+                department="general",
+                auth_source="server_registry"
+            )
+        )
+        res_user = self.client.post(
             "/ingest-folder",
             json={"folder_path": self.temp_dir},
-            headers=self.analyst_headers
+            headers={"Authorization": "Bearer test-registry-nonadmin-token"}
         )
-        self.assertEqual(res_analyst.status_code, 403)
-        self.assertIn("Administrator authorization required", res_analyst.json().get("detail", ""))
+        self.assertEqual(res_user.status_code, 403)
         self.assertIn("Administrator authorization required", res_user.json().get("detail", ""))
 
     def test_folder_03_rejects_path_traversal_outside_allowlisted_root(self):
@@ -5228,6 +5237,118 @@ class TestRequestLocalGuardedThresholdIntegrity(unittest.TestCase):
 
         self.assertEqual(errors, [], f"Concurrency errors detected: {errors}")
         self.assertEqual(engine.min_similarity_threshold, 0.30)
+
+
+class TestBuiltInCredentialBypassPrevention(unittest.TestCase):
+    """
+    Regression test suite verifying that built-in credentials (admin-token, analyst-token,
+    engineer-token, user-token) CANNOT bypass a configured production API key (RAG_API_KEY):
+    1. Setting RAG_API_KEY strictly rejects admin-token with 401 Unauthorized.
+    2. All other built-in tokens (analyst-token, engineer-token, user-token) are rejected with 401.
+    3. The valid configured RAG_API_KEY is accepted with full admin/service privileges.
+    4. Dynamically registered credentials from server credential registry / IDP are accepted.
+    5. In open development mode (RAG_API_KEY unset), built-in tokens are permitted for developer convenience.
+    6. Explicit test mode (RAG_ALLOW_BUILTIN_TOKENS=true) permits built-in tokens when explicitly enabled.
+    """
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        from main import app, principal_registry
+        self.app = app
+        self.client = TestClient(app)
+        self.principal_registry = principal_registry
+        self._orig_env = {
+            "RAG_API_KEY": os.environ.get("RAG_API_KEY"),
+            "RAG_ALLOW_BUILTIN_TOKENS": os.environ.get("RAG_ALLOW_BUILTIN_TOKENS"),
+            "RAG_ENV": os.environ.get("RAG_ENV"),
+        }
+
+    def tearDown(self):
+        for k, v in self._orig_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_builtin_01_admin_token_rejected_when_rag_api_key_configured(self):
+        """Attacker presenting built-in admin-token is rejected with 401 when RAG_API_KEY is configured."""
+        os.environ["RAG_API_KEY"] = "super-secret-production-key-2026"
+        os.environ.pop("RAG_ALLOW_BUILTIN_TOKENS", None)
+
+        # Attacker attempts to access protected endpoints using hard-coded admin-token
+        res_docs = self.client.get("/documents", headers={"Authorization": "Bearer admin-token"})
+        self.assertEqual(res_docs.status_code, 401)
+        self.assertIn("Built-in development credentials are disabled", res_docs.json().get("detail", ""))
+
+        res_clear = self.client.post("/clear-index", headers={"Authorization": "Bearer admin-token"})
+        self.assertEqual(res_clear.status_code, 401)
+        self.assertIn("Built-in development credentials are disabled", res_clear.json().get("detail", ""))
+
+        res_retrieve = self.client.post("/retrieve", json={"query": "test"}, headers={"Authorization": "Bearer admin-token"})
+        self.assertEqual(res_retrieve.status_code, 401)
+
+    def test_builtin_02_all_builtin_tokens_rejected_in_production(self):
+        """All built-in credentials are systematically rejected when RAG_API_KEY is configured."""
+        os.environ["RAG_API_KEY"] = "production-auth-key-xyz"
+        os.environ.pop("RAG_ALLOW_BUILTIN_TOKENS", None)
+
+        for token in ["admin-token", "analyst-token", "engineer-token", "user-token"]:
+            res = self.client.get("/documents", headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(res.status_code, 401, f"Token '{token}' should have been rejected with 401")
+            self.assertIn("Built-in development credentials are disabled", res.json().get("detail", ""))
+
+    def test_builtin_03_valid_configured_api_key_succeeds(self):
+        """The configured production RAG_API_KEY authenticates successfully with admin permissions."""
+        prod_key = "production-auth-key-valid-888"
+        os.environ["RAG_API_KEY"] = prod_key
+        os.environ.pop("RAG_ALLOW_BUILTIN_TOKENS", None)
+
+        res = self.client.get("/documents", headers={"Authorization": f"Bearer {prod_key}"})
+        self.assertEqual(res.status_code, 200)
+
+        # Confirm admin actions succeed with valid configured key
+        res_clear = self.client.post("/clear-index", headers={"Authorization": f"Bearer {prod_key}"})
+        self.assertEqual(res_clear.status_code, 200)
+
+    def test_builtin_04_server_registered_idp_credential_succeeds(self):
+        """Credentials dynamically issued/registered in the server-side registry are accepted in production."""
+        os.environ["RAG_API_KEY"] = "production-auth-key-xyz"
+        os.environ.pop("RAG_ALLOW_BUILTIN_TOKENS", None)
+
+        # Register server-side dynamic credential (e.g. from IDP / OAuth2)
+        from rag_core import AuthenticatedPrincipal
+        self.principal_registry.register(
+            "idp-oauth-token-sarah",
+            AuthenticatedPrincipal(
+                principal_id="sarah_analyst",
+                roles=["analyst"],
+                clearance_level="confidential",
+                department="finance",
+                auth_source="idp_gateway"
+            )
+        )
+
+        res = self.client.get("/documents", headers={"Authorization": "Bearer idp-oauth-token-sarah"})
+        self.assertEqual(res.status_code, 200)
+
+    def test_builtin_05_builtin_tokens_permitted_in_development_mode(self):
+        """When RAG_API_KEY is unset, built-in development credentials are permitted for testing/dev."""
+        os.environ.pop("RAG_API_KEY", None)
+        os.environ.pop("RAG_ALLOW_BUILTIN_TOKENS", None)
+
+        res_admin = self.client.get("/documents", headers={"Authorization": "Bearer admin-token"})
+        self.assertEqual(res_admin.status_code, 200)
+
+        res_user = self.client.get("/documents", headers={"Authorization": "Bearer user-token"})
+        self.assertEqual(res_user.status_code, 200)
+
+    def test_builtin_06_explicit_test_mode_flag_allows_builtin_tokens(self):
+        """Setting RAG_ALLOW_BUILTIN_TOKENS=true allows built-in tokens even when RAG_API_KEY is set."""
+        os.environ["RAG_API_KEY"] = "prod-key-active"
+        os.environ["RAG_ALLOW_BUILTIN_TOKENS"] = "true"
+
+        res = self.client.get("/documents", headers={"Authorization": "Bearer admin-token"})
+        self.assertEqual(res.status_code, 200)
 
 
 if __name__ == "__main__":
