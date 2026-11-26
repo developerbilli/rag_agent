@@ -4017,5 +4017,141 @@ class TestFailureOrientedScenarios(unittest.TestCase):
             shutil.rmtree(backup_dir, ignore_errors=True)
 
 
+class TestAPIAuthenticationAndRouteSeparation(unittest.TestCase):
+    """
+    Test suite verifying API authentication enforcement across all protected routes
+    and clean separation between public health/UI endpoints and data/mutation routes.
+    """
+
+    def setUp(self):
+        self._orig_rag_api_key = os.environ.get("RAG_API_KEY")
+        from main import app
+        from fastapi.testclient import TestClient
+        self.app = app
+        self.client = TestClient(app)
+
+    def tearDown(self):
+        if self._orig_rag_api_key is not None:
+            os.environ["RAG_API_KEY"] = self._orig_rag_api_key
+        else:
+            os.environ.pop("RAG_API_KEY", None)
+
+    def test_auth_01_open_developer_mode_when_rag_api_key_unset(self):
+        """When RAG_API_KEY is unset or empty, protected routes operate in open developer mode."""
+        os.environ.pop("RAG_API_KEY", None)
+        
+        # Public endpoints work
+        res_health = self.client.get("/health")
+        self.assertEqual(res_health.status_code, 200)
+
+        # Protected endpoints work without key
+        res_docs = self.client.get("/documents")
+        self.assertEqual(res_docs.status_code, 200)
+
+        res_retrieve = self.client.post("/retrieve", json={"query": "test query", "top_k": 1})
+        self.assertEqual(res_retrieve.status_code, 200)
+
+    def test_auth_02_enforce_api_key_when_rag_api_key_configured(self):
+        """When RAG_API_KEY is configured, unauthenticated requests to protected endpoints return 401."""
+        test_key = "secure-test-token-xyz-987"
+        os.environ["RAG_API_KEY"] = test_key
+
+        # Protected data reading endpoints
+        res_docs = self.client.get("/documents")
+        self.assertEqual(res_docs.status_code, 401)
+        self.assertIn("Unauthorized", res_docs.json().get("detail", ""))
+        self.assertEqual(res_docs.headers.get("www-authenticate"), "Bearer")
+
+        # Protected data querying endpoints
+        res_retrieve = self.client.post("/retrieve", json={"query": "test query"})
+        self.assertEqual(res_retrieve.status_code, 401)
+
+        # Protected ingestion endpoints
+        res_ingest = self.client.post("/ingest", json={"doc_id": "doc1", "text": "sample text", "title": "sample"})
+        self.assertEqual(res_ingest.status_code, 401)
+
+        # Protected path-parameter endpoints
+        res_doc_get = self.client.get("/documents/nonexistent_doc")
+        self.assertEqual(res_doc_get.status_code, 401)
+
+    def test_auth_03_reject_invalid_api_keys(self):
+        """Invalid API keys in headers, params, or body are rejected with 401."""
+        test_key = "secure-production-api-key"
+        os.environ["RAG_API_KEY"] = test_key
+
+        # Invalid header
+        res1 = self.client.get("/documents", headers={"X-API-Key": "invalid-key"})
+        self.assertEqual(res1.status_code, 401)
+
+        # Invalid Bearer token
+        res2 = self.client.get("/documents", headers={"Authorization": "Bearer invalid-bearer"})
+        self.assertEqual(res2.status_code, 401)
+
+        # Invalid query param
+        res3 = self.client.get("/documents?api_key=wrong-query-key")
+        self.assertEqual(res3.status_code, 401)
+
+        # Invalid body key
+        res4 = self.client.post("/retrieve", json={"query": "test", "api_key": "wrong-body-key"})
+        self.assertEqual(res4.status_code, 401)
+
+    def test_auth_04_accept_valid_credentials_across_all_schemes(self):
+        """Valid credentials succeed via X-API-Key, Authorization Bearer, query param, and JSON body."""
+        test_key = "master-rag-access-key-42"
+        os.environ["RAG_API_KEY"] = test_key
+
+        # 1. X-API-Key header
+        res1 = self.client.get("/documents", headers={"X-API-Key": test_key})
+        self.assertEqual(res1.status_code, 200)
+
+        # 2. Authorization Bearer header
+        res2 = self.client.get("/documents", headers={"Authorization": f"Bearer {test_key}"})
+        self.assertEqual(res2.status_code, 200)
+
+        # 3. Query parameter
+        res3 = self.client.get(f"/documents?api_key={test_key}")
+        self.assertEqual(res3.status_code, 200)
+
+        # 4. JSON body key on POST
+        res4 = self.client.post("/retrieve", json={"query": "test", "top_k": 1, "api_key": test_key})
+        self.assertEqual(res4.status_code, 200)
+
+    def test_auth_05_public_health_and_ui_endpoints_remain_accessible_without_key(self):
+        """Public system endpoints remain accessible without auth even when RAG_API_KEY is enforced."""
+        os.environ["RAG_API_KEY"] = "super-strict-production-key"
+
+        public_endpoints = [
+            "/",
+            "/health",
+            "/ui",
+            "/observability",
+            "/models-status"
+        ]
+        for endpoint in public_endpoints:
+            with self.subTest(endpoint=endpoint):
+                res = self.client.get(endpoint)
+                self.assertEqual(res.status_code, 200, f"Public endpoint {endpoint} failed with {res.status_code}")
+
+    def test_auth_06_mutation_endpoints_strictly_protected(self):
+        """Mutation endpoints like DELETE /documents/{doc_id} and POST /clear-index are blocked without credentials."""
+        test_key = "mutation-test-key"
+        os.environ["RAG_API_KEY"] = test_key
+
+        # Blocked without key: document deletion
+        res_del = self.client.delete("/documents/doc_test_mutation")
+        self.assertEqual(res_del.status_code, 401)
+
+        # Blocked without key: clear index
+        res_clear = self.client.post("/clear-index")
+        self.assertEqual(res_clear.status_code, 401)
+
+        # Allowed with key
+        res_clear_auth = self.client.post(
+            "/clear-index",
+            headers={"X-API-Key": test_key}
+        )
+        self.assertEqual(res_clear_auth.status_code, 200)
+
+
 if __name__ == "__main__":
     unittest.main()

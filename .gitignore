@@ -24,3 +24,4 @@ ENV/
 # Runtime storage snapshots (keep directory, ignore dynamic snapshots)
 storage/*
 !storage/.gitkeep
+

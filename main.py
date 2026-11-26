@@ -10,7 +10,9 @@ Interactive Web UI: (/ and /ui)
 
 import os
 import time
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Header, Query
+import secrets
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Header, Query, Depends, Security, APIRouter
+from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
@@ -45,6 +47,61 @@ app = FastAPI(
     description="Production-grade offline RAG pipeline combining BM25 keyword retrieval and dense-vector retrieval with Reciprocal Rank Fusion (RRF), cross-encoder reranking, transactional rollback, propositional claim verification, and multi-turn memory.",
     version="2.0.0"
 )
+
+# Authentication Schemes & Dependencies (Item 12 & Security Hardening)
+api_key_header_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
+bearer_scheme = HTTPBearer(auto_error=False)
+
+async def verify_api_key(
+    request: Request,
+    header_key: Optional[str] = Security(api_key_header_scheme),
+    bearer_token: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme),
+) -> bool:
+    """
+    Enforces API key / Bearer token authentication when RAG_API_KEY is configured in the environment.
+    Permits open developer mode when RAG_API_KEY is not set or empty.
+    Checks:
+    1. X-API-Key header (via Security scheme)
+    2. Authorization: Bearer <key> header (via Security scheme)
+    3. api_key query parameter
+    4. JSON body 'api_key' field (if application/json)
+    """
+    expected = os.environ.get("RAG_API_KEY")
+    if not expected:
+        return True
+
+    provided = header_key or request.headers.get("X-API-Key")
+    if not provided and bearer_token:
+        provided = bearer_token.credentials
+    if not provided:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            provided = auth_header.replace("Bearer ", "").strip()
+
+    if not provided:
+        provided = request.query_params.get("api_key")
+
+    if not provided and request.headers.get("content-type", "").startswith("application/json"):
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                provided = body.get("api_key")
+        except Exception:
+            pass
+
+    if not provided or not secrets.compare_digest(str(provided), str(expected)):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: Invalid or missing API key.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return True
+
+# ==============================================================================
+# ROUTER ARCHITECTURE: Explicit Separation of Public vs. Protected Endpoints
+# ==============================================================================
+public_router = APIRouter(tags=["Public & System"])
+protected_router = APIRouter(dependencies=[Depends(verify_api_key)], tags=["Data & Operations"])
 
 # Global in-memory state
 chunker = TextChunker(chunk_size=200, overlap=40)
@@ -110,25 +167,6 @@ class QueryRequest(BaseModel):
 
 MAX_UPLOAD_SIZE = 25 * 1024 * 1024  # 25 MB enterprise upload guard (Item 12)
 
-def verify_api_key(request: Request) -> bool:
-    """
-    Enforces API key / Bearer token authentication when RAG_API_KEY is configured (Item 12).
-    Permits open developer mode when RAG_API_KEY is not set.
-    """
-    import secrets
-    expected = os.environ.get("RAG_API_KEY")
-    if not expected:
-        return True
-
-    header_key = request.headers.get("X-API-Key")
-    auth_header = request.headers.get("Authorization", "")
-    bearer_key = auth_header.replace("Bearer ", "").strip() if auth_header.startswith("Bearer ") else None
-    provided = header_key or bearer_key
-
-    if not provided or not secrets.compare_digest(provided, expected):
-        raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing API key.")
-    return True
-
 class EvalItem(BaseModel):
     query: str
     relevant_doc_ids: List[str]
@@ -169,10 +207,11 @@ def auto_ingest_sample_corpus():
 
 
 # ==========================================
-# UI DASHBOARD & SYSTEM STATUS
+# PUBLIC ENDPOINTS: UI DASHBOARD & SYSTEM HEALTH
+# (Unauthenticated: accessible by browsers, Prometheus, Kubernetes probes)
 # ==========================================
-@app.get("/", response_class=HTMLResponse)
-@app.get("/ui", response_class=HTMLResponse)
+@public_router.get("/", response_class=HTMLResponse)
+@public_router.get("/ui", response_class=HTMLResponse)
 def serve_ui(request: Request):
     """Serves the interactive web UI dashboard."""
     ui_path = os.path.join(os.path.dirname(__file__), "ui", "index.html")
@@ -181,19 +220,19 @@ def serve_ui(request: Request):
     return HTMLResponse("<h2>Tiny RAG Studio UI file not found.</h2>", status_code=404)
 
 
-@app.get("/observability")
+@public_router.get("/observability")
 def get_observability_metrics():
     """Returns operational dashboard metrics including P50/P90/P95 latencies, QPS, cache hit rates, guardrails, and document states."""
     return dashboard.get_metrics(indexer)
 
 
-@app.get("/health")
+@public_router.get("/health")
 def get_health_status():
     """Returns system health check status, offline policy adherence, index generation, and uptime."""
     return dashboard.get_health_status(indexer)
 
 
-@app.get("/models-status")
+@public_router.get("/models-status")
 def models_status():
     """Returns status of local Ollama, Gemini API, and index stats."""
     ollama_status = LLMGenerator.check_ollama_status()
@@ -223,7 +262,7 @@ def models_status():
 # ==========================================
 # PHASE 1 — Naive Baseline (No Retrieval)
 # ==========================================
-@app.post("/generate-naive")
+@protected_router.post("/generate-naive")
 def generate_naive(req: QueryRequest):
     """
     Phase 1: Demonstrates response generation WITHOUT retrieval.
@@ -244,7 +283,7 @@ def generate_naive(req: QueryRequest):
 # ==========================================
 # PHASE 2 — Ingest Pipeline & File Loading
 # ==========================================
-@app.post("/ingest")
+@protected_router.post("/ingest")
 def ingest_documents(req: IngestRequest):
     """
     Phase 2: Ingests documents, chunks them, embeds vectors, and indexes them in memory.
@@ -267,7 +306,7 @@ def ingest_documents(req: IngestRequest):
     }
 
 
-@app.post("/upload")
+@protected_router.post("/upload")
 async def upload_files(files: List[UploadFile] = File(...)):
     """
     Phase 2: Uploads one or more files (.pdf, .txt, .md, and code formats), chunks them, and adds to index.
@@ -321,7 +360,7 @@ async def upload_files(files: List[UploadFile] = File(...)):
     }
 
 
-@app.post("/ingest-folder")
+@protected_router.post("/ingest-folder")
 def ingest_folder(req: IngestFolderRequest):
     """
     Phase 2: Scans a local folder on disk for .pdf, .txt, and .md files and indexes them.
@@ -347,7 +386,7 @@ def ingest_folder(req: IngestFolderRequest):
     }
 
 
-@app.post("/clear-index")
+@protected_router.post("/clear-index")
 def clear_index():
     """Clears all indexed chunks from memory."""
     indexer.clear()
@@ -357,7 +396,7 @@ def clear_index():
     }
 
 
-@app.get("/index-status")
+@protected_router.get("/index-status")
 def index_status():
     reg = getattr(indexer, 'version_registry', None)
     return {
@@ -380,7 +419,7 @@ class ReplaceDocumentRequest(BaseModel):
     title: Optional[str] = ""
     metadata: Optional[Dict[str, Any]] = None
 
-@app.delete("/documents/{doc_id}")
+@protected_router.delete("/documents/{doc_id}")
 def delete_document_endpoint(doc_id: str, hard_delete: Optional[bool] = False):
     """
     Deletes a document by ID, evicting chunks from dense/BM25 indices and invalidating cache.
@@ -390,7 +429,7 @@ def delete_document_endpoint(doc_id: str, hard_delete: Optional[bool] = False):
         raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found.")
     return res
 
-@app.put("/documents/{doc_id}")
+@protected_router.put("/documents/{doc_id}")
 def replace_document_endpoint(doc_id: str, req: ReplaceDocumentRequest):
     """
     Atomically replaces a document with new content and re-indexes dense/BM25 representations.
@@ -407,7 +446,7 @@ def replace_document_endpoint(doc_id: str, req: ReplaceDocumentRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/documents/{doc_id}/restore")
+@protected_router.post("/documents/{doc_id}/restore")
 def restore_document_endpoint(doc_id: str):
     """
     Restores a soft-deleted document from source document tracking and re-indexes it.
@@ -418,7 +457,7 @@ def restore_document_endpoint(doc_id: str):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/documents/cleanup-orphans")
+@protected_router.post("/documents/cleanup-orphans")
 def cleanup_orphans_endpoint(
     quarantine_malformed: bool = Query(True),
     reconcile_stale: bool = Query(True)
@@ -436,7 +475,7 @@ def cleanup_orphans_endpoint(
         reconcile_stale=reconcile_stale
     )
 
-@app.get("/documents/quarantine")
+@protected_router.get("/documents/quarantine")
 def list_quarantined_chunks_endpoint():
     """
     Returns all chunks quarantined due to missing, invalid, or malformed document IDs.
@@ -447,7 +486,7 @@ def list_quarantined_chunks_endpoint():
         "quarantined_chunks": getattr(indexer, 'quarantined_chunks', [])
     }
 
-@app.get("/documents")
+@protected_router.get("/documents")
 def list_documents_endpoint(
     x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
     x_clearance_level: Optional[str] = Header(None, alias="X-Clearance-Level"),
@@ -482,7 +521,7 @@ def list_documents_endpoint(
         "documents": filtered_docs
     }
 
-@app.get("/documents/{doc_id}")
+@protected_router.get("/documents/{doc_id}")
 def get_document_endpoint(
     doc_id: str,
     x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
@@ -553,7 +592,7 @@ def get_document_endpoint(
 # ==========================================
 # PHASE 3 — Retrieve, Generate & Evaluate
 # ==========================================
-@app.post("/route-query")
+@protected_router.post("/route-query")
 def route_query_endpoint(req: QueryRequest):
     """
     Classifies the user query into one of predefined routes (Dense, BM25, SQL, Document Lookup, Multi-Hop, Clarification, Hybrid Structured)
@@ -577,7 +616,7 @@ def route_query_endpoint(req: QueryRequest):
     }
 
 
-@app.post("/retrieve")
+@protected_router.post("/retrieve")
 def retrieve_context(req: QueryRequest):
     """
     Retrieves Top-K relevant context chunks for a given query.
@@ -630,7 +669,7 @@ def retrieve_context(req: QueryRequest):
     }
 
 
-@app.post("/generate-rag")
+@protected_router.post("/generate-rag")
 def generate_rag(req: QueryRequest):
     """
     Phase 3: Retrieves context, builds context-bounded prompt, and generates grounded response.
@@ -709,7 +748,7 @@ def generate_rag(req: QueryRequest):
     }
 
 
-@app.post("/eval-recall")
+@protected_router.post("/eval-recall")
 def run_eval(req: EvalRequest):
     """
     Phase 3 Eval Harness: Measures Recall@K retrieval accuracy over a test dataset.
@@ -725,7 +764,7 @@ def run_eval(req: EvalRequest):
 # ==========================================
 # PHASE 4 — Guardrails & Faithfulness
 # ==========================================
-@app.post("/generate-guarded")
+@protected_router.post("/generate-guarded")
 def generate_guarded(req: QueryRequest):
     """
     Phase 4: Integrates confidence thresholds & faithfulness guardrails before generation.
@@ -846,7 +885,7 @@ def generate_guarded(req: QueryRequest):
     }
 
 
-@app.post("/scan-injection")
+@protected_router.post("/scan-injection")
 def scan_prompt_injection(req: InjectionScanRequest):
     """
     Security Layer: Scans input text for indirect prompt injection and document security threats.
@@ -855,7 +894,7 @@ def scan_prompt_injection(req: InjectionScanRequest):
     return assessment.to_dict()
 
 
-@app.get("/small-model-audit")
+@protected_router.get("/small-model-audit")
 def get_small_model_compatibility_audit():
     """
     Small LLM Compatibility Audit:
@@ -866,7 +905,7 @@ def get_small_model_compatibility_audit():
     return SmallModelCompatibilityAudit.get_audit_report()
 
 
-@app.post("/compute-factual")
+@protected_router.post("/compute-factual")
 def execute_factual_computation_endpoint(req: FactualComputeRequest):
     """
     Decoupled Factual & Mathematical Computation Pipeline (Small LLM Optimization):
@@ -903,7 +942,7 @@ def execute_factual_computation_endpoint(req: FactualComputeRequest):
 # ==========================================
 # PHASE 5 — Conversation Memory & Session API
 # ==========================================
-@app.get("/sessions")
+@protected_router.get("/sessions")
 def list_sessions():
     """Returns active conversation session summaries."""
     return {
@@ -911,7 +950,7 @@ def list_sessions():
     }
 
 
-@app.get("/sessions/{session_id}")
+@protected_router.get("/sessions/{session_id}")
 def get_session(session_id: str):
     """Returns conversation history for a specific session."""
     return {
@@ -920,7 +959,7 @@ def get_session(session_id: str):
     }
 
 
-@app.delete("/sessions/{session_id}")
+@protected_router.delete("/sessions/{session_id}")
 def clear_session(session_id: str):
     """Clears history for a specific session."""
     cleared = conversation_manager.clear_session(session_id)
@@ -928,3 +967,10 @@ def clear_session(session_id: str):
         "session_id": session_id,
         "cleared": cleared
     }
+
+
+# ==============================================================================
+# MOUNT PUBLIC AND PROTECTED ROUTERS ONTO FASTAPI APP
+# ==============================================================================
+app.include_router(public_router)
+app.include_router(protected_router)
