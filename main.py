@@ -190,12 +190,66 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 principal_registry = PrincipalRegistry()
 
-def is_production_auth_configured() -> bool:
-    """Checks whether production authentication is configured."""
-    has_api_key = bool(os.environ.get("RAG_API_KEY", "").strip())
+def get_auth_mode() -> str:
+    """
+    Resolves the active authentication mode ('development' or 'production').
+    Configured explicitly via RAG_AUTH_MODE=development|production.
+    
+    If RAG_AUTH_MODE is unset, falls back to RAG_ENV or ENVIRONMENT if set to 'production'/'prod',
+    otherwise defaults to 'development' for local developer convenience.
+    """
+    raw_mode = os.environ.get("RAG_AUTH_MODE", "").strip().lower()
+    if raw_mode in ("production", "prod"):
+        return "production"
+    if raw_mode in ("development", "dev", "local", "test"):
+        return "development"
+    if raw_mode:
+        raise ValueError(f"Invalid RAG_AUTH_MODE '{raw_mode}'. Expected 'development' or 'production'.")
+
+    # If RAG_AUTH_MODE is not explicitly specified, check RAG_ENV / ENVIRONMENT
     is_prod_env = os.environ.get("RAG_ENV", "").strip().lower() in ("production", "prod") or \
                   os.environ.get("ENVIRONMENT", "").strip().lower() in ("production", "prod")
-    return has_api_key or is_prod_env
+    if is_prod_env:
+        return "production"
+    return "development"
+
+
+def has_auth_configuration() -> bool:
+    """
+    Returns True if an authoritative authentication mechanism is configured
+    (RAG_API_KEY is non-empty or principal_registry contains non-builtin credentials).
+    """
+    has_api_key = bool(os.environ.get("RAG_API_KEY", "").strip())
+    has_custom_tokens = any(
+        not principal_registry.is_builtin_token(t)
+        for t in principal_registry._token_to_principal.keys()
+    )
+    return has_api_key or has_custom_tokens
+
+
+def is_production_auth_configured() -> bool:
+    """Checks whether production authentication policy is active or configured."""
+    return get_auth_mode() == "production" or bool(os.environ.get("RAG_API_KEY", "").strip())
+
+
+def validate_auth_configuration() -> None:
+    """
+    Startup authentication validator.
+    In production mode (RAG_AUTH_MODE=production or production environment):
+    Fails startup if no authentication configuration exists (e.g. RAG_API_KEY is absent).
+    """
+    auth_mode = get_auth_mode()
+    if auth_mode == "production":
+        if not has_auth_configuration():
+            err_msg = (
+                "Production startup failed: RAG_AUTH_MODE is set to 'production' "
+                "(or production environment detected), but no authentication configuration exists "
+                "(RAG_API_KEY is absent or empty). "
+                "Open developer mode without authentication is prohibited in production. "
+                "Set RAG_API_KEY to a secure secret, or set RAG_AUTH_MODE=development for local testing."
+            )
+            logger.critical(f"[Security Startup Violation] {err_msg}")
+            raise RuntimeError(err_msg)
 
 
 def are_builtin_tokens_allowed() -> bool:
@@ -332,6 +386,13 @@ async def get_current_principal(
                     detail="Unauthorized: Invalid or missing API key.",
                     headers={"WWW-Authenticate": "Bearer"},
                 )
+        else:
+            # A credential was provided, but didn't match any registered token and no RAG_API_KEY was configured
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized: Invalid API key or credential.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
     # 4. When RAG_API_KEY is configured in the environment and no credential was provided:
     if expected:
@@ -341,7 +402,15 @@ async def get_current_principal(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # 5. Open Developer Mode: When RAG_API_KEY is unset and no valid credential was provided
+    # In production auth mode, unauthenticated access is strictly forbidden
+    if get_auth_mode() == "production":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Production authentication is enforced (RAG_AUTH_MODE=production). Provide credentials via 'Authorization: Bearer <key>' or 'X-API-Key' headers.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 5. Open Developer Mode: When RAG_API_KEY is unset and no valid credential was provided (development mode only)
     return principal_registry.get_default_developer_principal()
 
 
@@ -579,6 +648,12 @@ class FactualComputeRequest(BaseModel):
 
 
 @app.on_event("startup")
+def startup_auth_validation():
+    """Enforce production authentication requirements on server startup."""
+    validate_auth_configuration()
+
+
+@app.on_event("startup")
 def auto_ingest_sample_corpus():
     """Seed index on startup through canonical lifecycle API."""
     for doc in SAMPLE_DOCUMENTS:
@@ -633,8 +708,10 @@ def get_observability_metrics():
 
 @public_router.get("/health")
 def get_health_status():
-    """Returns system health check status, offline policy adherence, index generation, and uptime."""
-    return dashboard.get_health_status(indexer)
+    """Returns system health check status, offline policy adherence, index generation, uptime, and auth mode."""
+    res = dashboard.get_health_status(indexer)
+    res["auth_mode"] = get_auth_mode()
+    return res
 
 
 @public_router.get("/models-status")

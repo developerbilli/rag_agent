@@ -211,13 +211,14 @@ The file upload endpoint (`POST /upload`) enforces defense-in-depth protections 
 
 ## 🔐 Authentication & Transport Security
 
-In production environments (`RAG_API_KEY` configured or `RAG_ENV=production`), the pipeline enforces strict header-only authentication to protect against credential leaks in access logs, browser history, and monitoring traces:
+The pipeline provides configurable authentication modes via `RAG_AUTH_MODE=development|production`:
 
-- **Accepted Headers**:
-  - `Authorization: Bearer <token>`
-  - `X-API-Key: <token>`
-- **Rejected Transport Schemes**:
-  - URL query parameters (`?api_key=...`) are rejected with HTTP 400 Bad Request.
-  - JSON body fields (`{"api_key": ...}`) are rejected with HTTP 400 Bad Request.
+- **Production Mode (`RAG_AUTH_MODE=production` or `RAG_ENV=production`)**:
+  - **Fail-Fast Startup**: If `RAG_API_KEY` is not configured, the service fails startup immediately with `RuntimeError`, preventing accidental unauthenticated production deployments.
+  - **Zero Open Access**: Unauthenticated requests are rejected with HTTP 401 Unauthorized.
+  - **Built-in Token Blocking**: Development credentials (`admin-token`, `user-token`) are strictly blocked.
+  - **Strict Header Transport**: Credentials must be supplied via headers (`Authorization: Bearer <token>` or `X-API-Key: <token>`). Credentials in query strings or JSON bodies are rejected with HTTP 400 Bad Request.
+- **Development Mode (`RAG_AUTH_MODE=development`)**:
+  - Local developers can explore APIs without configuring an API key, assigned a scoped non-privileged `dev_user` principal.
 - **Automated Log Redaction**:
   - `SensitiveHeaderRedactionFilter` automatically masks Bearer tokens, `X-API-Key` headers, and credential query strings across all system loggers, replacing sensitive tokens with `[REDACTED]`.

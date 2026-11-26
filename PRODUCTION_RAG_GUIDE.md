@@ -370,14 +370,18 @@ In production environments, credentials transmitted via URL query strings or JSO
 - **JSON Request Bodies** (`{"api_key": ...}`): Complicate request parsing and risk exposure in error tracing or payload dumps.
 
 ### Implementation Safeguards (`main.py`):
-1. **Header-Only Authentication**:
-   - In production (`RAG_API_KEY` configured or `RAG_ENV=production`), callers must authenticate exclusively through dedicated headers:
+1. **Explicit Authentication Mode (`RAG_AUTH_MODE=development|production`)**:
+   - `RAG_AUTH_MODE=production`: Open developer mode is completely disabled. Startup validator `validate_auth_configuration()` enforces that `RAG_API_KEY` (or custom server credentials) is configured; if missing, server startup immediately halts with `RuntimeError`. All unauthenticated requests are strictly rejected with HTTP 401.
+   - `RAG_AUTH_MODE=development`: Permits local development without an API key under a restricted default user principal (`dev_user`, role: `user`).
+   - If unset, production mode is automatically inferred if `RAG_ENV=production` or `ENVIRONMENT=production`.
+2. **Header-Only Authentication**:
+   - In production (`RAG_AUTH_MODE=production` or `RAG_API_KEY` configured), callers must authenticate exclusively through dedicated headers:
      - `Authorization: Bearer <token>`
      - `X-API-Key: <token>`
-2. **Strict Query/Body Rejection**:
+3. **Strict Query/Body Rejection**:
    - Requests attempting to pass `api_key` via URL query parameters or JSON bodies are immediately rejected with HTTP `400 Bad Request` explaining the policy violation.
    - Even if a valid header is also provided, presence of query parameter credentials triggers rejection to prevent URL-based credential exposure.
-3. **Automated Log Redaction (`SensitiveHeaderRedactionFilter`)**:
+4. **Automated Log Redaction (`SensitiveHeaderRedactionFilter`)**:
    - Global logging filter installed on `logger`, root logger, Uvicorn, and ASGI servers.
    - Automatically sanitizes Bearer tokens, `X-API-Key` values, authorization headers, and query parameters, replacing secrets with `[REDACTED]`.
    - Utility `redact_headers(dict)` strips sensitive header values prior to structured logging or debugging.

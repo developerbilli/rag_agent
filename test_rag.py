@@ -5934,5 +5934,162 @@ class TestHybridRetrievalWiringAndAPIIntegration(unittest.TestCase):
         self.assertEqual(data["retrieved_chunks"][0].get("modality"), "rrf")
 
 
+class TestAuthModeAndStartupValidation(unittest.TestCase):
+    """
+    Test suite verifying explicit RAG_AUTH_MODE (development vs production) and
+    fail-fast startup validation:
+    1. Defaults to 'development' mode when unset.
+    2. 'development' mode permits open developer mode without API key.
+    3. 'production' mode strictly fails startup (raises RuntimeError) when RAG_API_KEY is absent.
+    4. RAG_ENV=production or ENVIRONMENT=production also triggers production mode and fails startup without key.
+    5. 'production' mode succeeds startup when RAG_API_KEY is properly configured.
+    6. 'production' mode rejects unauthenticated requests with 401 Unauthorized (never returns developer principal).
+    7. Invalid RAG_AUTH_MODE values raise ValueError.
+    8. Health endpoint exposes the active auth_mode.
+    """
+
+    def setUp(self):
+        self._orig_env = {
+            "RAG_AUTH_MODE": os.environ.get("RAG_AUTH_MODE"),
+            "RAG_API_KEY": os.environ.get("RAG_API_KEY"),
+            "RAG_ENV": os.environ.get("RAG_ENV"),
+            "ENVIRONMENT": os.environ.get("ENVIRONMENT"),
+            "RAG_ALLOW_BUILTIN_TOKENS": os.environ.get("RAG_ALLOW_BUILTIN_TOKENS"),
+        }
+        from main import (
+            app,
+            get_auth_mode,
+            has_auth_configuration,
+            validate_auth_configuration,
+            principal_registry
+        )
+        self.app = app
+        self.get_auth_mode = get_auth_mode
+        self.has_auth_configuration = has_auth_configuration
+        self.validate_auth_configuration = validate_auth_configuration
+        self.principal_registry = principal_registry
+
+    def tearDown(self):
+        for k, v in self._orig_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_01_auth_mode_defaults_to_development_when_unset(self):
+        """When RAG_AUTH_MODE is unset, auth mode defaults to development."""
+        os.environ.pop("RAG_AUTH_MODE", None)
+        os.environ.pop("RAG_ENV", None)
+        os.environ.pop("ENVIRONMENT", None)
+
+        self.assertEqual(self.get_auth_mode(), "development")
+        # In development mode, validation succeeds without RAG_API_KEY
+        os.environ.pop("RAG_API_KEY", None)
+        try:
+            self.validate_auth_configuration()
+        except RuntimeError:
+            self.fail("validate_auth_configuration() raised RuntimeError unexpectedly in development mode")
+
+    def test_02_explicit_development_mode_permits_open_developer_principal(self):
+        """RAG_AUTH_MODE=development permits unauthenticated access under default developer principal."""
+        os.environ["RAG_AUTH_MODE"] = "development"
+        os.environ.pop("RAG_API_KEY", None)
+
+        from fastapi.testclient import TestClient
+        client = TestClient(self.app)
+        res = client.get("/documents")
+        self.assertEqual(res.status_code, 200)
+
+    def test_03_production_mode_fails_startup_without_api_key(self):
+        """RAG_AUTH_MODE=production fails startup with RuntimeError when no RAG_API_KEY is configured."""
+        os.environ["RAG_AUTH_MODE"] = "production"
+        os.environ.pop("RAG_API_KEY", None)
+
+        # 1. Direct validator function raises RuntimeError
+        with self.assertRaises(RuntimeError) as cm:
+            self.validate_auth_configuration()
+        self.assertIn("Production startup failed", str(cm.exception))
+        self.assertIn("RAG_AUTH_MODE is set to 'production'", str(cm.exception))
+
+        # 2. FastAPI lifespan / startup execution raises RuntimeError
+        from fastapi.testclient import TestClient
+        with self.assertRaises(RuntimeError) as cm_client:
+            with TestClient(self.app):
+                pass
+        self.assertIn("Production startup failed", str(cm_client.exception))
+
+    def test_04_production_inferred_from_rag_env_fails_startup_without_key(self):
+        """RAG_ENV=production triggers production auth mode and fails startup when key is absent."""
+        os.environ.pop("RAG_AUTH_MODE", None)
+        os.environ["RAG_ENV"] = "production"
+        os.environ.pop("RAG_API_KEY", None)
+
+        self.assertEqual(self.get_auth_mode(), "production")
+        with self.assertRaises(RuntimeError) as cm:
+            self.validate_auth_configuration()
+        self.assertIn("Production startup failed", str(cm.exception))
+
+    def test_05_production_inferred_from_environment_fails_startup_without_key(self):
+        """ENVIRONMENT=prod triggers production auth mode and fails startup when key is absent."""
+        os.environ.pop("RAG_AUTH_MODE", None)
+        os.environ["ENVIRONMENT"] = "prod"
+        os.environ.pop("RAG_API_KEY", None)
+
+        self.assertEqual(self.get_auth_mode(), "production")
+        with self.assertRaises(RuntimeError) as cm:
+            self.validate_auth_configuration()
+        self.assertIn("Production startup failed", str(cm.exception))
+
+    def test_06_production_mode_startup_succeeds_with_api_key(self):
+        """RAG_AUTH_MODE=production succeeds startup when valid RAG_API_KEY is configured."""
+        os.environ["RAG_AUTH_MODE"] = "production"
+        os.environ["RAG_API_KEY"] = "production-valid-secret-key-42"
+        os.environ.pop("RAG_ALLOW_BUILTIN_TOKENS", None)
+
+        # Validation succeeds
+        self.validate_auth_configuration()
+
+        from fastapi.testclient import TestClient
+        with TestClient(self.app) as client:
+            # Unauthenticated request rejected with 401
+            res_anon = client.get("/documents")
+            self.assertEqual(res_anon.status_code, 401)
+
+            # Authenticated request with valid key succeeds
+            res_auth = client.get("/documents", headers={"Authorization": "Bearer production-valid-secret-key-42"})
+            self.assertEqual(res_auth.status_code, 200)
+
+    def test_07_production_mode_unauthenticated_request_strictly_rejected_with_401(self):
+        """In production mode, unauthenticated requests return 401 and never receive developer principal."""
+        os.environ["RAG_AUTH_MODE"] = "production"
+        os.environ["RAG_API_KEY"] = "secure-production-credential-789"
+
+        from fastapi.testclient import TestClient
+        client = TestClient(self.app)
+
+        res_docs = client.get("/documents")
+        self.assertEqual(res_docs.status_code, 401)
+        self.assertIn("Unauthorized", res_docs.json().get("detail", ""))
+
+        res_retrieve = client.post("/retrieve", json={"query": "test query"})
+        self.assertEqual(res_retrieve.status_code, 401)
+
+    def test_08_invalid_auth_mode_raises_value_error(self):
+        """Invalid RAG_AUTH_MODE setting raises ValueError."""
+        os.environ["RAG_AUTH_MODE"] = "unsupported_mode"
+        with self.assertRaises(ValueError) as cm:
+            self.get_auth_mode()
+        self.assertIn("Invalid RAG_AUTH_MODE", str(cm.exception))
+
+    def test_09_health_endpoint_reports_active_auth_mode(self):
+        """GET /health reports the active auth_mode."""
+        os.environ["RAG_AUTH_MODE"] = "development"
+        from fastapi.testclient import TestClient
+        client = TestClient(self.app)
+        res = client.get("/health")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json().get("auth_mode"), "development")
+
+
 if __name__ == "__main__":
     unittest.main()
