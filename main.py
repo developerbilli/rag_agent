@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Header, Q
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger("rag_api.auth")
 
@@ -160,6 +160,17 @@ def build_authoritative_user_context(
     safe_ctx = {k: v for k, v in client_context.items() if k not in ("roles", "clearance_level", "user_id", "department")}
     safe_ctx.update(auth_ctx)
     return safe_ctx
+
+
+def resolve_scoped_session(principal: AuthenticatedPrincipal, requested_session_id: Optional[str]) -> Tuple[str, str]:
+    """
+    Resolves client-requested session identifier to an authenticated-user scoped session ID.
+    Returns (client_visible_session_id, internal_scoped_session_id).
+    Prevents cross-caller conversation history leaks when session_id is omitted or set to 'default'.
+    """
+    raw_session = (requested_session_id or "default").strip()
+    scoped_session = ConversationManager.scoped_session_id(principal.principal_id, raw_session)
+    return raw_session, scoped_session
 
 
 # ==============================================================================
@@ -452,8 +463,16 @@ def ingest_folder(req: IngestFolderRequest):
 
 
 @protected_router.post("/clear-index")
-def clear_index():
-    """Clears all indexed chunks from memory."""
+def clear_index(principal: AuthenticatedPrincipal = Depends(get_current_principal)):
+    """
+    Clears all indexed chunks from memory.
+    Destructive mutation strictly restricted to administrators.
+    """
+    if not principal.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Administrative privileges required to clear index."
+        )
     indexer.clear()
     return {
         "status": "cleared",
@@ -462,8 +481,30 @@ def clear_index():
 
 
 @protected_router.get("/index-status")
-def index_status():
+def index_status(
+    include_text: bool = Query(False),
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+):
+    """
+    Operational index status and health diagnostics.
+    Omits full document text to prevent sensitive data leakage.
+    Full text export requires administrator privileges and explicit include_text=true.
+    """
     reg = getattr(indexer, 'version_registry', None)
+    allow_full_text = include_text and principal.is_admin()
+
+    chunks_telemetry = []
+    for c in indexer.chunks:
+        entry = {
+            "chunk_id": c.get("chunk_id"),
+            "doc_id": c.get("doc_id"),
+            "char_count": len(c.get("text", "")),
+            "metadata": c.get("metadata", {})
+        }
+        if allow_full_text:
+            entry["text"] = c.get("text", "")
+        chunks_telemetry.append(entry)
+
     return {
         "total_indexed_chunks": len(indexer.chunks),
         "index_generation": getattr(indexer, 'index_generation', 1),
@@ -472,7 +513,7 @@ def index_status():
         "storage_backend": "sqlite_disk" if getattr(indexer, 'disk_store', None) else "numpy_memory",
         "registry": reg.registry if reg else {},
         "source_documents_count": len(getattr(indexer, 'source_documents', {})),
-        "chunks": indexer.chunks
+        "chunks": chunks_telemetry
     }
 
 
@@ -485,20 +526,40 @@ class ReplaceDocumentRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 @protected_router.delete("/documents/{doc_id}")
-def delete_document_endpoint(doc_id: str, hard_delete: Optional[bool] = False):
+def delete_document_endpoint(
+    doc_id: str,
+    hard_delete: Optional[bool] = False,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+):
     """
     Deletes a document by ID, evicting chunks from dense/BM25 indices and invalidating cache.
+    Destructive mutation strictly restricted to administrators.
     """
+    if not principal.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Administrative privileges required to delete documents."
+        )
     res = indexer.delete_document(doc_id, hard_delete=hard_delete)
     if res.get("status") == "not_found":
         raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found.")
     return res
 
 @protected_router.put("/documents/{doc_id}")
-def replace_document_endpoint(doc_id: str, req: ReplaceDocumentRequest):
+def replace_document_endpoint(
+    doc_id: str,
+    req: ReplaceDocumentRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+):
     """
     Atomically replaces a document with new content and re-indexes dense/BM25 representations.
+    Destructive mutation strictly restricted to administrators.
     """
+    if not principal.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Administrative privileges required to replace documents."
+        )
     try:
         res = indexer.replace_document(
             doc_id=doc_id,
@@ -512,10 +573,19 @@ def replace_document_endpoint(doc_id: str, req: ReplaceDocumentRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 @protected_router.post("/documents/{doc_id}/restore")
-def restore_document_endpoint(doc_id: str):
+def restore_document_endpoint(
+    doc_id: str,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+):
     """
     Restores a soft-deleted document from source document tracking and re-indexes it.
+    Index restoration strictly restricted to administrators.
     """
+    if not principal.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Administrative privileges required to restore documents."
+        )
     try:
         res = indexer.restore_document(doc_id=doc_id, chunker=chunker)
         return res
@@ -525,30 +595,56 @@ def restore_document_endpoint(doc_id: str):
 @protected_router.post("/documents/cleanup-orphans")
 def cleanup_orphans_endpoint(
     quarantine_malformed: bool = Query(True),
-    reconcile_stale: bool = Query(True)
+    reconcile_stale: bool = Query(True),
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
 ):
     """
-    Cleans up chunk lifecycle anomalies across 5 distinct states:
-    1. Parent missing: removed as true orphan
-    2. Parent soft-deleted: removed from active indices, preserved in archival storage
-    3. Parent active: retained in active indices
-    4. Parent content hash/version mismatch: reconciled (stale chunks evicted)
-    5. Malformed doc_id: quarantined
+    Cleans up chunk lifecycle anomalies across 5 distinct states.
+    Restricted to administrators.
     """
+    if not principal.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Administrative privileges required to run orphan cleanup."
+        )
     return indexer.cleanup_orphaned_chunks(
         quarantine_malformed=quarantine_malformed,
         reconcile_stale=reconcile_stale
     )
 
 @protected_router.get("/documents/quarantine")
-def list_quarantined_chunks_endpoint():
+def list_quarantined_chunks_endpoint(
+    include_content: bool = Query(False),
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+):
     """
-    Returns all chunks quarantined due to missing, invalid, or malformed document IDs.
+    Returns quarantined chunk diagnostics.
+    Restricted to administrators to protect unvalidated or sensitive payloads.
+    Omits full content text to prevent sensitive data exposure.
     """
+    if not principal.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Administrator authorization required to view quarantined chunks."
+        )
+
+    quarantined = getattr(indexer, 'quarantined_chunks', [])
+    sanitized = []
+    for c in quarantined:
+        entry = {
+            "chunk_id": c.get("chunk_id", "unknown"),
+            "doc_id": c.get("doc_id", "missing"),
+            "reason": c.get("quarantine_reason", c.get("reason", "malformed_metadata")),
+            "char_count": len(c.get("text", "")) if "text" in c else 0
+        }
+        if include_content:
+            entry["content_preview"] = (c.get("text", "")[:100] + "...") if len(c.get("text", "")) > 100 else c.get("text", "")
+        sanitized.append(entry)
+
     return {
         "status": "success",
-        "total_quarantined": len(getattr(indexer, 'quarantined_chunks', [])),
-        "quarantined_chunks": getattr(indexer, 'quarantined_chunks', [])
+        "total_quarantined": len(quarantined),
+        "quarantined_chunks": sanitized
     }
 
 @protected_router.get("/documents")
@@ -750,19 +846,19 @@ def generate_rag(
     """
     Phase 3: Retrieves context, builds context-bounded prompt, and generates grounded response.
     Supports multi-backend generation (Ollama, Gemini, Offline) and multi-turn memory.
-    Authoritative user_context is derived server-side from authenticated principal.
+    Authoritative user_context and conversation session are strictly scoped server-side to the authenticated principal.
     """
-    session_id = req.session_id or "default"
+    client_sess_id, scoped_sess_id = resolve_scoped_session(principal, req.session_id)
     standalone_query = req.query
     history = []
     trusted_user_context = build_authoritative_user_context(principal, req.user_context)
 
     # 1. Memory / Query Condensation
     if req.use_memory:
-        history = conversation_manager.get_history(session_id)
+        history = conversation_manager.get_history(scoped_sess_id)
         if history:
             standalone_query = conversation_manager.condense_query(
-                session_id=session_id,
+                session_id=scoped_sess_id,
                 query=req.query,
                 backend=req.backend or "auto",
                 model=req.model,
@@ -799,10 +895,10 @@ def generate_rag(
     # 5. Injection telemetry audit
     injection_audit = PromptInjectionGuard.scan_retrieved_chunks(retrieved)
 
-    # 6. Record Turn in Conversation Memory
+    # 6. Record Turn in Conversation Memory (scoped to authenticated user)
     if req.use_memory:
         conversation_manager.add_turn(
-            session_id=session_id,
+            session_id=scoped_sess_id,
             user_query=req.query,
             assistant_answer=output["answer"],
             citations=output.get("provenance", []),
@@ -813,7 +909,8 @@ def generate_rag(
         "phase": "Phase 3: Retrieve & Generate",
         "query": req.query,
         "standalone_query": standalone_query,
-        "session_id": session_id,
+        "session_id": client_sess_id,
+        "scoped_session_id": scoped_sess_id,
         "history_turn_count": len(history),
         "prompt": prompt,
         "retrieved_chunks": retrieved,
@@ -850,20 +947,20 @@ def generate_guarded(
     """
     Phase 4: Integrates confidence thresholds & faithfulness guardrails before generation.
     Supports multi-turn memory and query condensation.
-    Authoritative user_context is derived server-side from authenticated principal.
+    Authoritative user_context and conversation sessions are strictly scoped server-side to the authenticated principal.
     """
     t0 = time.perf_counter()
-    session_id = req.session_id or "default"
+    client_sess_id, scoped_sess_id = resolve_scoped_session(principal, req.session_id)
     standalone_query = req.query
     history = []
     trusted_user_context = build_authoritative_user_context(principal, req.user_context)
 
     # 1. Memory / Query Condensation
     if req.use_memory:
-        history = conversation_manager.get_history(session_id)
+        history = conversation_manager.get_history(scoped_sess_id)
         if history:
             standalone_query = conversation_manager.condense_query(
-                session_id=session_id,
+                session_id=scoped_sess_id,
                 query=req.query,
                 backend=req.backend or "auto",
                 model=req.model,
@@ -889,7 +986,7 @@ def generate_guarded(
         answer = "I cannot answer this based on the provided context."
         if req.use_memory:
             conversation_manager.add_turn(
-                session_id=session_id,
+                session_id=scoped_sess_id,
                 user_query=req.query,
                 assistant_answer=answer,
                 citations=[],
@@ -902,7 +999,8 @@ def generate_guarded(
             "phase": "Phase 4: Guardrails",
             "query": req.query,
             "standalone_query": standalone_query,
-            "session_id": session_id,
+            "session_id": client_sess_id,
+            "scoped_session_id": scoped_sess_id,
             "history_turn_count": len(history),
             "status": "BLOCKED_BY_GUARDRAIL",
             "reason": reason,
@@ -939,10 +1037,10 @@ def generate_guarded(
     dashboard.record_guardrail_event(True, reason, injection_detected=bool(injection_audit.get("injection_detected")))
     dashboard.record_request("/generate-guarded", latency_ms=lat_ms, status="SUCCESS")
 
-    # 4. Record Turn in Memory
+    # 4. Record Turn in Memory (scoped to authenticated user)
     if req.use_memory:
         conversation_manager.add_turn(
-            session_id=session_id,
+            session_id=scoped_sess_id,
             user_query=req.query,
             assistant_answer=output["answer"],
             citations=output.get("provenance", []),
@@ -953,7 +1051,8 @@ def generate_guarded(
         "phase": "Phase 4: Guardrails",
         "query": req.query,
         "standalone_query": standalone_query,
-        "session_id": session_id,
+        "session_id": client_sess_id,
+        "scoped_session_id": scoped_sess_id,
         "history_turn_count": len(history),
         "status": "PASSED",
         "guardrail_reason": reason,
@@ -1031,26 +1130,77 @@ def execute_factual_computation_endpoint(
 # PHASE 5 — Conversation Memory & Session API
 # ==========================================
 @protected_router.get("/sessions")
-def list_sessions():
-    """Returns active conversation session summaries."""
-    return {
-        "sessions": conversation_manager.list_sessions()
-    }
+def list_sessions(principal: AuthenticatedPrincipal = Depends(get_current_principal)):
+    """
+    Returns active conversation session summaries scoped to the authenticated user.
+    Administrators can view all system sessions; regular users only see their own.
+    """
+    all_sessions = conversation_manager.list_sessions()
+    if principal.is_admin():
+        return {"sessions": all_sessions}
+
+    user_prefix = f"{principal.principal_id}:"
+    user_sessions = []
+    for s in all_sessions:
+        sid = s.get("session_id", "")
+        if sid.startswith(user_prefix):
+            user_sessions.append({
+                "session_id": sid[len(user_prefix):],
+                "turn_count": s.get("turn_count", 0),
+                "last_active": s.get("last_active", 0.0),
+                "last_query": s.get("last_query")
+            })
+    return {"sessions": user_sessions}
 
 
 @protected_router.get("/sessions/{session_id}")
-def get_session(session_id: str):
-    """Returns conversation history for a specific session."""
+def get_session(
+    session_id: str,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+):
+    """
+    Returns conversation history for a specific session scoped to the authenticated user.
+    Prevents unauthorized access to other callers' conversation logs.
+    """
+    # 1. Look up principal-scoped session
+    scoped_id = ConversationManager.scoped_session_id(principal.principal_id, session_id)
+    history = conversation_manager.get_history(scoped_id, max_turns=50)
+
+    # 2. If not found and caller is admin, allow reading raw session_id
+    if not history and principal.is_admin():
+        history = conversation_manager.get_history(session_id, max_turns=50)
+
+    # 3. Cross-user access prevention check
+    if not history:
+        if ":" in session_id and not principal.is_admin():
+            owner = session_id.split(":", 1)[0]
+            if owner != principal.principal_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Access denied: Cannot access conversation session belonging to another user."
+                )
+
     return {
         "session_id": session_id,
-        "history": conversation_manager.get_history(session_id, max_turns=50)
+        "history": history
     }
 
 
 @protected_router.delete("/sessions/{session_id}")
-def clear_session(session_id: str):
-    """Clears history for a specific session."""
-    cleared = conversation_manager.clear_session(session_id)
+def clear_session(
+    session_id: str,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+):
+    """
+    Clears conversation history for a specific session scoped to the authenticated user.
+    """
+    scoped_id = ConversationManager.scoped_session_id(principal.principal_id, session_id)
+    cleared = conversation_manager.clear_session(scoped_id)
+
+    # If caller is admin and raw session_id exists, allow clearing
+    if not cleared and principal.is_admin():
+        cleared = conversation_manager.clear_session(session_id)
+
     return {
         "session_id": session_id,
         "cleared": cleared

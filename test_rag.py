@@ -4436,5 +4436,149 @@ class TestCrossDepartmentCacheIsolationAndReauthorization(unittest.TestCase):
         self.assertFalse(any(c["doc_id"] == "doc_eng" for c in res_fin))
 
 
+class TestSensitiveEndpointsAndSessionIsolationProtection(unittest.TestCase):
+    """
+    Security verification tests proving that sensitive operational endpoints
+    do not expose raw document text, index mutations are strictly restricted
+    to administrators, and conversation sessions are isolated per authenticated user.
+    """
+
+    def setUp(self):
+        from main import app, indexer as main_indexer, chunker as main_chunker
+        from fastapi.testclient import TestClient
+        self.app = app
+        self.indexer = main_indexer
+        self.chunker = main_chunker
+        self.client = TestClient(app)
+
+        self.indexer.clear()
+        self.indexer.stage_and_commit_document("doc_secret_strat", "Confidential strategic plan text.", "Strategy", self.chunker)
+
+    def test_sens_01_index_status_omits_raw_document_text(self):
+        """Operational index status returns metadata and char count, avoiding full document text dump."""
+        # 1. Ordinary user queries /index-status
+        res = self.client.get("/index-status", headers={"Authorization": "Bearer user-token"})
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertIn("chunks", data)
+        self.assertGreater(len(data["chunks"]), 0)
+        for c in data["chunks"]:
+            self.assertNotIn("text", c, "Operational status API must omit raw chunk text to prevent data leakage!")
+            self.assertIn("char_count", c)
+            self.assertIn("doc_id", c)
+
+        # 2. Ordinary user passing include_text=true is still denied raw text
+        res_user_text = self.client.get("/index-status?include_text=true", headers={"Authorization": "Bearer user-token"})
+        self.assertEqual(res_user_text.status_code, 200)
+        for c in res_user_text.json()["chunks"]:
+            self.assertNotIn("text", c)
+
+        # 3. Administrator with explicit include_text=true can audit text
+        res_admin = self.client.get("/index-status?include_text=true", headers={"Authorization": "Bearer admin-token"})
+        self.assertEqual(res_admin.status_code, 200)
+        for c in res_admin.json()["chunks"]:
+            self.assertIn("text", c)
+
+    def test_sens_02_quarantine_endpoint_requires_admin_and_omits_raw_text(self):
+        """Quarantine diagnostics require administrator role and omit full raw content."""
+        self.indexer.quarantined_chunks = [{"chunk_id": "q1", "doc_id": "malformed", "text": "sensitive quarantine text"}]
+
+        # Ordinary user is denied
+        res_user = self.client.get("/documents/quarantine", headers={"Authorization": "Bearer user-token"})
+        self.assertEqual(res_user.status_code, 403)
+
+        # Admin is permitted, but full raw text is omitted
+        res_admin = self.client.get("/documents/quarantine", headers={"Authorization": "Bearer admin-token"})
+        self.assertEqual(res_admin.status_code, 200)
+        chunks = res_admin.json().get("quarantined_chunks", [])
+        self.assertEqual(len(chunks), 1)
+        self.assertNotIn("text", chunks[0])
+        self.assertIn("char_count", chunks[0])
+
+    def test_sens_03_index_mutations_restricted_to_administrators(self):
+        """Destructive index mutations (clear, delete, replace, restore) are blocked for non-admins."""
+        user_headers = {"Authorization": "Bearer user-token"}
+        admin_headers = {"Authorization": "Bearer admin-token"}
+
+        # 1. Clear index
+        res_clear_user = self.client.post("/clear-index", headers=user_headers)
+        self.assertEqual(res_clear_user.status_code, 403)
+
+        # 2. Delete document
+        res_del_user = self.client.delete("/documents/doc_secret_strat", headers=user_headers)
+        self.assertEqual(res_del_user.status_code, 403)
+
+        # 3. Replace document
+        res_rep_user = self.client.put("/documents/doc_secret_strat", json={"text": "new"}, headers=user_headers)
+        self.assertEqual(res_rep_user.status_code, 403)
+
+        # 4. Restore document
+        res_rest_user = self.client.post("/documents/doc_secret_strat/restore", headers=user_headers)
+        self.assertEqual(res_rest_user.status_code, 403)
+
+        # 5. Cleanup orphans
+        res_orph_user = self.client.post("/documents/cleanup-orphans", headers=user_headers)
+        self.assertEqual(res_orph_user.status_code, 403)
+
+        # Verify admin can perform mutation
+        res_del_admin = self.client.delete("/documents/doc_secret_strat", headers=admin_headers)
+        self.assertEqual(res_del_admin.status_code, 200)
+
+    def test_sens_04_default_session_id_is_isolated_per_authenticated_user(self):
+        """Callers that do not provide a session ID (default) do NOT share conversation history."""
+        user_a_headers = {"Authorization": "Bearer user-token"}
+        user_b_headers = {"Authorization": "Bearer analyst-token"}
+
+        # User A sends a query with use_memory=True (default session)
+        r_a = self.client.post(
+            "/generate-rag",
+            json={"query": "Alice secret inquiry about quantum computing", "use_memory": True},
+            headers=user_a_headers
+        )
+        self.assertEqual(r_a.status_code, 200)
+
+        # User B sends a query with use_memory=True (default session)
+        r_b = self.client.post(
+            "/generate-rag",
+            json={"query": "Bob unrelated question on database indexing", "use_memory": True},
+            headers=user_b_headers
+        )
+        self.assertEqual(r_b.status_code, 200)
+
+        # Inspect User A's default session
+        sess_a = self.client.get("/sessions/default", headers=user_a_headers)
+        self.assertEqual(sess_a.status_code, 200)
+        history_a = sess_a.json()["history"]
+        self.assertEqual(len(history_a), 1)
+        self.assertIn("quantum computing", history_a[0]["user"])
+        self.assertNotIn("database indexing", history_a[0]["user"])
+
+        # Inspect User B's default session
+        sess_b = self.client.get("/sessions/default", headers=user_b_headers)
+        self.assertEqual(sess_b.status_code, 200)
+        history_b = sess_b.json()["history"]
+        self.assertEqual(len(history_b), 1)
+        self.assertIn("database indexing", history_b[0]["user"])
+        self.assertNotIn("quantum computing", history_b[0]["user"])
+
+    def test_sens_05_cross_user_session_access_blocked(self):
+        """User cannot read or delete another user's session history directly."""
+        user_a_headers = {"Authorization": "Bearer user-token"}
+        user_b_headers = {"Authorization": "Bearer analyst-token"}
+
+        # User A creates session "confidential_chat"
+        self.client.post(
+            "/generate-rag",
+            json={"query": "Proprietary algorithm discussion", "session_id": "confidential_chat", "use_memory": True},
+            headers=user_a_headers
+        )
+
+        # User B attempts to access User A's scoped session directly
+        scoped_target = f"standard_user:confidential_chat"
+        res_hack = self.client.get(f"/sessions/{scoped_target}", headers=user_b_headers)
+        self.assertEqual(res_hack.status_code, 403)
+        self.assertIn("Cannot access conversation session belonging to another user", res_hack.json().get("detail", ""))
+
+
 if __name__ == "__main__":
     unittest.main()
