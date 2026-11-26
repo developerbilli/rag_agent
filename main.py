@@ -658,12 +658,15 @@ def auto_ingest_sample_corpus():
     """Seed index on startup through canonical lifecycle API."""
     for doc in SAMPLE_DOCUMENTS:
         try:
+            doc_meta = dict(doc.get("metadata", {}))
+            doc_meta.setdefault("owner_id", "system")
+            doc_meta.setdefault("created_by", "system")
             indexer.stage_and_commit_document(
                 doc_id=doc["doc_id"],
                 text=doc["text"],
                 title=doc["title"],
                 chunker=chunker,
-                metadata=doc.get("metadata", {})
+                metadata=doc_meta
             )
         except Exception as e:
             print(f"[Startup] Error seeding {doc.get('doc_id')}: {e}")
@@ -675,12 +678,15 @@ def auto_ingest_sample_corpus():
             for doc in extra_docs:
                 raw_text = doc.get("text", "").strip()
                 if raw_text:
+                    extra_meta = dict(doc.get("metadata", {}))
+                    extra_meta.setdefault("owner_id", "system")
+                    extra_meta.setdefault("created_by", "system")
                     indexer.stage_and_commit_document(
                         doc_id=doc["doc_id"],
                         text=raw_text,
                         title=doc.get("title", doc["doc_id"]),
                         chunker=chunker,
-                        metadata=doc.get("metadata", {})
+                        metadata=extra_meta
                     )
         except Exception as e:
             print(f"[Startup] Error auto-loading sample_data: {e}")
@@ -766,12 +772,39 @@ def generate_naive(req: QueryRequest):
 # PHASE 2 — Ingest Pipeline & File Loading
 # ==========================================
 @protected_router.post("/ingest")
-def ingest_documents(req: IngestRequest):
+def ingest_documents(
+    req: IngestRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+):
     """
     Phase 2: Ingests documents, chunks them, embeds vectors, and indexes them in memory.
     Routes every document through canonical lifecycle management (stage_and_commit_document).
     Guarantees revision tracking, atomic publication, and chunk ID uniqueness.
+
+    Security & Authorization:
+    - Strictly restricted to administrative and data_admin roles (admin, superuser, data_admin, sysadmin).
+    - Ordinary users (role: user) are denied with HTTP 403 Forbidden to prevent direct document tampering.
+    - Records comprehensive audit logs for all attempts (principal_id, doc_id, operation, result).
     """
+    # 1. Administrative or data_admin authorization required
+    if not (principal.is_admin() or principal.has_role("data_admin")):
+        target_ids = [d.doc_id for d in req.documents] if req.documents else []
+        dashboard.record_document_audit_event(
+            principal_id=principal.principal_id,
+            doc_id=",".join(target_ids) if target_ids else "empty",
+            operation="ingest",
+            result="FORBIDDEN",
+            details={"roles": principal.roles, "reason": "Insufficient administrative privileges for raw JSON ingestion"}
+        )
+        logger.warning(
+            f"[Security Audit] Ingestion denied: principal_id='{principal.principal_id}', "
+            f"roles={principal.roles}, target_docs={target_ids}. Operation: 'ingest', Result: 'FORBIDDEN'"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Administrative or data_admin privileges required to ingest documents directly."
+        )
+
     chunker.chunk_size = req.chunk_size or 150
     chunker.overlap = req.overlap or 30
 
@@ -779,15 +812,39 @@ def ingest_documents(req: IngestRequest):
     total_chunks_created = 0
 
     for doc in req.documents:
+        existing_doc = indexer.get_document_status(doc.doc_id, include_deleted=True)
+        op_type = "replace" if existing_doc else "create"
+
+        doc_meta = dict(doc.metadata or {})
+        doc_meta.setdefault("owner_id", principal.principal_id)
+        doc_meta.setdefault("created_by", principal.principal_id)
+
         res = indexer.stage_and_commit_document(
             doc_id=doc.doc_id,
             text=doc.text,
             title=doc.title,
             chunker=chunker,
-            metadata=doc.metadata
+            metadata=doc_meta
         )
         results.append(res)
         total_chunks_created += res.get("chunks_indexed", 0)
+
+        audit_result = "SUCCESS" if res.get("status") in ("committed", "skipped") else "FAILED"
+        dashboard.record_document_audit_event(
+            principal_id=principal.principal_id,
+            doc_id=doc.doc_id,
+            operation=op_type,
+            result=audit_result,
+            details={
+                "version": res.get("version"),
+                "status": res.get("status"),
+                "chunks_indexed": res.get("chunks_indexed", 0)
+            }
+        )
+        logger.info(
+            f"[Security Audit] Document {op_type}: principal_id='{principal.principal_id}', "
+            f"doc_id='{doc.doc_id}', version={res.get('version')}, result='{audit_result}'"
+        )
 
     return {
         "phase": "Phase 2: Ingest Pipeline",
@@ -868,13 +925,21 @@ async def read_bounded_upload_file(
 
 
 @protected_router.post("/upload")
-async def upload_files(files: List[UploadFile] = File(...)):
+async def upload_files(
+    files: List[UploadFile] = File(...),
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+):
     """
     Phase 2: Uploads one or more files (.pdf, .txt, .md, and code formats).
     Streams uploads in bounded chunks to prevent denial-of-service (DoS) memory exhaustion.
     Enforces request-level file count and cumulative size limits.
     Routes every document through canonical lifecycle management (stage_and_commit_document).
     Guarantees revision tracking, idempotent re-upload handling, and chunk ID uniqueness.
+
+    Security & Authorization:
+    - Enforces Document Ownership: Ordinary users CANNOT overwrite/replace documents they do not own.
+    - Separates document creation permission from document replacement permission.
+    - Records comprehensive audit logs with principal ID, document ID, operation, and result.
     """
     if not files:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No files provided.")
@@ -930,14 +995,86 @@ async def upload_files(files: List[UploadFile] = File(...)):
                 errors.append(f"'{filename}': File is empty or contains unreadable/scanned content")
                 continue
 
+            doc_id = doc["doc_id"]
+
+            # Document Ownership & Replacement Authorization Check
+            existing_doc = indexer.get_document_status(doc_id, include_deleted=True)
+            if existing_doc:
+                op_type = "replace"
+                existing_owner = existing_doc.get("owner_id") or existing_doc.get("metadata", {}).get("owner_id") or "system"
+
+                # 1. Prohibit overwriting documents owned by others (system, admin, other users)
+                if not principal.is_admin() and existing_owner != principal.principal_id:
+                    dashboard.record_document_audit_event(
+                        principal_id=principal.principal_id,
+                        doc_id=doc_id,
+                        operation="overwrite_rejected",
+                        result="FORBIDDEN",
+                        details={
+                            "existing_owner": existing_owner,
+                            "filename": filename,
+                            "reason": "Caller does not own existing document"
+                        }
+                    )
+                    logger.warning(
+                        f"[Security Audit] Overwrite rejected: principal_id='{principal.principal_id}' "
+                        f"attempted to overwrite document '{doc_id}' owned by '{existing_owner}'. "
+                        f"Operation: 'upload_overwrite', Result: 'FORBIDDEN'"
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=f"Access denied: Document '{doc_id}' already exists and is owned by '{existing_owner}'. "
+                               f"You do not have permission to overwrite documents you do not own."
+                    )
+
+                # 2. Separate creation from replacement: verify caller replacement privileges
+                if not principal.is_admin():
+                    allow_own = os.environ.get("RAG_ALLOW_USER_DOCUMENT_REPLACEMENT", "true").lower() in ("true", "1", "yes")
+                    if not (allow_own or any(r in ("editor", "doc_editor", "data_admin") for r in principal.roles)):
+                        dashboard.record_document_audit_event(
+                            principal_id=principal.principal_id,
+                            doc_id=doc_id,
+                            operation="overwrite_rejected",
+                            result="FORBIDDEN",
+                            details={"reason": "User lacks document replacement permission"}
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail=f"Access denied: Principal '{principal.principal_id}' lacks document replacement permission."
+                        )
+            else:
+                op_type = "create"
+
+            doc_meta = dict(doc.get("metadata", {}))
+            doc_meta.setdefault("owner_id", principal.principal_id)
+            doc_meta.setdefault("created_by", principal.principal_id)
+
             res = indexer.stage_and_commit_document(
                 doc_id=doc["doc_id"],
                 text=raw_text,
                 title=doc["title"],
                 chunker=chunker,
-                metadata=doc.get("metadata", {})
+                metadata=doc_meta
             )
             results.append(res)
+
+            audit_result = "SUCCESS" if res.get("status") in ("committed", "skipped") else "FAILED"
+            dashboard.record_document_audit_event(
+                principal_id=principal.principal_id,
+                doc_id=doc_id,
+                operation=op_type,
+                result=audit_result,
+                details={
+                    "filename": filename,
+                    "version": res.get("version"),
+                    "status": res.get("status"),
+                    "chunks_indexed": res.get("chunks_indexed", 0)
+                }
+            )
+            logger.info(
+                f"[Security Audit] Upload {op_type}: principal_id='{principal.principal_id}', "
+                f"doc_id='{doc_id}', version={res.get('version')}, result='{audit_result}'"
+            )
 
             if res.get("status") == "skipped" and res.get("reason") == "no_text_chunks":
                 errors.append(f"'{filename}': Produced 0 chunks (insufficient text)")
@@ -945,6 +1082,8 @@ async def upload_files(files: List[UploadFile] = File(...)):
 
             total_chunks_created += res.get("chunks_indexed", 0)
             processed_count += 1
+        except HTTPException:
+            raise
         except Exception as e:
             err_msg = f"'{filename}': {str(e)}"
             errors.append(err_msg)

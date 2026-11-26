@@ -222,3 +222,7 @@ The pipeline provides configurable authentication modes via `RAG_AUTH_MODE=devel
   - Local developers can explore APIs without configuring an API key, assigned a scoped non-privileged `dev_user` principal.
 - **Automated Log Redaction**:
   - `SensitiveHeaderRedactionFilter` automatically masks Bearer tokens, `X-API-Key` headers, and credential query strings across all system loggers, replacing sensitive tokens with `[REDACTED]`.
+- **Ingestion RBAC & Document Ownership**:
+  - `POST /ingest` requires administrative or `data_admin` privileges; regular users receive HTTP 403 Forbidden.
+  - `POST /upload` tracks document `owner_id`. Regular users cannot overwrite documents owned by others (system or other users), returning HTTP 403 Forbidden on foreign overwrite attempts.
+  - Document lifecycle operations record audit trails (`principal_id`, `doc_id`, `operation`, `result`).

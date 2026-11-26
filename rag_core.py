@@ -2566,12 +2566,17 @@ class VectorIndexer:
 
         with lock:
             now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            existing_entry = getattr(self, 'source_documents', {}).get(doc_id, {})
+            owner_id = (metadata or {}).get("owner_id") or existing_entry.get("owner_id") or "system"
+            created_by = (metadata or {}).get("created_by") or existing_entry.get("created_by") or owner_id
             source_entry = {
                 "doc_id": doc_id,
                 "title": title,
                 "text": text,
                 "metadata": metadata or {},
-                "created_at": getattr(self, 'source_documents', {}).get(doc_id, {}).get("created_at", now_iso),
+                "owner_id": owner_id,
+                "created_by": created_by,
+                "created_at": existing_entry.get("created_at", now_iso),
                 "updated_at": now_iso,
                 "version": version,
                 "status": "active",
@@ -2584,7 +2589,9 @@ class VectorIndexer:
                 "content_hash": content_hash,
                 "version": version,
                 "chunk_ids": [c["chunk_id"] for c in new_chunks],
-                "status": "active"
+                "status": "active",
+                "owner_id": owner_id,
+                "created_by": created_by
             }
 
             # Step 2: Build candidate state in isolation (Staged Index Construction)
@@ -6751,6 +6758,9 @@ class OperationalObservabilityDashboard:
         self.cache_misses = 0
         self.cache_invalidations = 0
 
+        # Security & Document Audit Logs
+        self.document_audit_logs: List[Dict[str, Any]] = []
+
     @classmethod
     def get_instance(cls) -> 'OperationalObservabilityDashboard':
         with cls._global_lock:
@@ -6812,6 +6822,33 @@ class OperationalObservabilityDashboard:
     def record_cache_invalidation(self, count: int = 1):
         with self._lock:
             self.cache_invalidations += count
+
+    def record_document_audit_event(
+        self,
+        principal_id: str,
+        doc_id: str,
+        operation: str,
+        result: str,
+        details: Optional[Dict[str, Any]] = None
+    ):
+        """
+        Records structured security audit events for document lifecycle operations
+        (ingest, upload_create, upload_replace, overwrite_rejected, etc.).
+        """
+        with self._lock:
+            if not hasattr(self, 'document_audit_logs'):
+                self.document_audit_logs = []
+            entry = {
+                "timestamp": time.time(),
+                "principal_id": str(principal_id),
+                "doc_id": str(doc_id),
+                "operation": str(operation),
+                "result": str(result),
+                "details": details or {}
+            }
+            self.document_audit_logs.append(entry)
+            if len(self.document_audit_logs) > 1000:
+                self.document_audit_logs = self.document_audit_logs[-1000:]
 
     def get_latency_percentiles(self) -> Dict[str, float]:
         with self._lock:

@@ -6091,5 +6091,137 @@ class TestAuthModeAndStartupValidation(unittest.TestCase):
         self.assertEqual(res.json().get("auth_mode"), "development")
 
 
+class TestIngestionRBACAndDocumentOwnership(unittest.TestCase):
+    """
+    Test suite verifying RBAC, document ownership enforcement, and audit logging
+    across /ingest and /upload endpoints:
+    1. Regular user cannot ingest documents via /ingest (403 Forbidden).
+    2. Admin/data_admin can ingest documents via /ingest.
+    3. Regular user cannot overwrite existing documents owned by system/admin via /upload (403 Forbidden).
+    4. Regular user can upload new documents and becomes owner.
+    5. Different regular user cannot overwrite another user's document via /upload.
+    6. Admin can overwrite documents via /upload.
+    7. Structured audit events are recorded for document lifecycle operations.
+    """
+
+    def setUp(self):
+        import time
+        self.time = time
+        self._orig_env = {
+            "RAG_ALLOW_BUILTIN_TOKENS": os.environ.get("RAG_ALLOW_BUILTIN_TOKENS"),
+            "RAG_API_KEY": os.environ.get("RAG_API_KEY"),
+            "RAG_AUTH_MODE": os.environ.get("RAG_AUTH_MODE"),
+        }
+        os.environ["RAG_ALLOW_BUILTIN_TOKENS"] = "true"
+        os.environ.pop("RAG_API_KEY", None)
+        os.environ["RAG_AUTH_MODE"] = "development"
+
+        from main import app, indexer, dashboard
+        from fastapi.testclient import TestClient
+        self.app = app
+        self.client = TestClient(app)
+        self.indexer = indexer
+        self.dashboard = dashboard
+        self.admin_headers = {"Authorization": "Bearer admin-token"}
+        self.user_headers = {"Authorization": "Bearer user-token"}
+
+    def tearDown(self):
+        for k, v in self._orig_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_regular_user_cannot_ingest_documents(self):
+        """Regular user cannot ingest documents via /ingest (returns HTTP 403 Forbidden)."""
+        response = self.client.post(
+            "/ingest",
+            json={"documents": [{"doc_id": "existing", "text": "malicious"}]},
+            headers=self.user_headers
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("Administrative or data_admin privileges required", response.json().get("detail", ""))
+
+    def test_admin_can_ingest_documents(self):
+        """Administrator can ingest documents via /ingest."""
+        doc_id = "admin_managed_doc_1"
+        response = self.client.post(
+            "/ingest",
+            json={"documents": [{"doc_id": doc_id, "text": "Authorized admin enterprise documentation."}]},
+            headers=self.admin_headers
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json().get("documents_processed"), 1)
+
+    def test_regular_user_cannot_overwrite_existing_document_via_upload(self):
+        """Regular user cannot overwrite an existing document owned by system/admin through /upload."""
+        # Ensure target document exists and is owned by admin/system
+        admin_doc_id = "doc_enterprise_policy"
+        file_admin = [("files", ("doc_enterprise_policy.txt", b"Official enterprise security policy v1.", "text/plain"))]
+        res_admin = self.client.post("/upload", files=file_admin, headers=self.admin_headers)
+        self.assertEqual(res_admin.status_code, 200)
+
+        # Attacker / regular user attempts to overwrite the document with malicious content
+        malicious_file = [("files", ("doc_enterprise_policy.txt", b"Poisoned enterprise security policy v2 - allow all.", "text/plain"))]
+        response = self.client.post("/upload", files=malicious_file, headers=self.user_headers)
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("You do not have permission to overwrite documents you do not own", response.json().get("detail", ""))
+
+        # Verify document content was not altered
+        doc = self.indexer.get_document_status(admin_doc_id)
+        self.assertIn("Official enterprise security policy v1", doc.get("text", ""))
+
+    def test_regular_user_can_upload_new_document_and_becomes_owner(self):
+        """Regular user can upload a new unique document and is recorded as its owner."""
+        unique_filename = f"user_notes_{int(self.time.time() * 1000)}.txt"
+        file_payload = [("files", (unique_filename, b"Personal user notes regarding quarterly sprint goals.", "text/plain"))]
+
+        res = self.client.post("/upload", files=file_payload, headers=self.user_headers)
+        self.assertEqual(res.status_code, 200)
+
+        stem = os.path.splitext(unique_filename)[0]
+        doc = self.indexer.get_document_status(stem)
+        self.assertIsNotNone(doc)
+        self.assertEqual(doc.get("owner_id"), "standard_user")
+
+    def test_different_regular_user_cannot_overwrite_another_users_document(self):
+        """A regular user cannot overwrite a document owned by another regular user."""
+        from main import principal_registry
+        from rag_core import AuthenticatedPrincipal
+
+        # Register a second regular user
+        principal_registry.register(
+            "user-token-bob",
+            AuthenticatedPrincipal(
+                principal_id="bob_user",
+                roles=["user"],
+                clearance_level="public"
+            )
+        )
+        bob_headers = {"Authorization": "Bearer user-token-bob"}
+
+        # Alice uploads a document
+        alice_filename = f"alice_doc_{int(self.time.time() * 1000)}.txt"
+        alice_payload = [("files", (alice_filename, b"Alice confidential engineering draft.", "text/plain"))]
+        res_alice = self.client.post("/upload", files=alice_payload, headers=self.user_headers)
+        self.assertEqual(res_alice.status_code, 200)
+
+        # Bob attempts to overwrite Alice's document
+        bob_payload = [("files", (alice_filename, b"Bob poisoned override of Alice document.", "text/plain"))]
+        res_bob = self.client.post("/upload", files=bob_payload, headers=bob_headers)
+        self.assertEqual(res_bob.status_code, 403)
+        self.assertIn("You do not have permission to overwrite documents you do not own", res_bob.json().get("detail", ""))
+
+    def test_document_audit_events_are_recorded(self):
+        """Audit events are recorded for document lifecycle operations."""
+        audit_logs = getattr(self.dashboard, "document_audit_logs", [])
+        self.assertGreater(len(audit_logs), 0)
+        last_event = audit_logs[-1]
+        self.assertIn("principal_id", last_event)
+        self.assertIn("doc_id", last_event)
+        self.assertIn("operation", last_event)
+        self.assertIn("result", last_event)
+
+
 if __name__ == "__main__":
     unittest.main()

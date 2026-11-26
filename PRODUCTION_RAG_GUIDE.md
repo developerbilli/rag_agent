@@ -388,5 +388,26 @@ In production environments, credentials transmitted via URL query strings or JSO
 
 ---
 
+## Production Security: Role-Based Ingestion & Document Ownership Protection
+
+Allowing ordinary authenticated users to ingest or overwrite documents exposes the knowledge base to document-poisoning, unauthorized data replacement, and index tampering.
+
+### Implementation Safeguards (`main.py` & `rag_core.py`):
+1. **Role-Based Access Control on Ingestion Routes**:
+   - `POST /ingest`: Strictly restricted to `admin`, `superuser`, `data_admin`, or `sysadmin`. Direct JSON ingestion by regular users (`role: user`) is rejected with HTTP `403 Forbidden`.
+   - `POST /ingest-folder`: Strictly restricted to administrators and completely disableable in hosted environments.
+2. **Document Ownership Tracking & Overwrite Protection**:
+   - Every ingested or uploaded document explicitly records `owner_id` (and `created_by`) in both metadata and canonical source document tracking (`VectorIndexer.source_documents`).
+   - `POST /upload`: When a regular user uploads a file matching an existing document ID:
+     - If the existing document is owned by system, admin, or another user, the overwrite attempt is rejected with HTTP `403 Forbidden`.
+     - Regular users cannot poison or replace documents they do not own.
+3. **Separation of Creation from Replacement**:
+   - Document creation (`upload_create`) is permitted for authenticated users.
+   - Document replacement (`upload_replace`) requires administrative privileges or explicit document ownership with replacement permission.
+4. **Structured Security Audit Logging**:
+   - All document operations (`create`, `replace`, `overwrite_rejected`, `ingest`) record structured security audit logs in `OperationalObservabilityDashboard.record_document_audit_event()` with `principal_id`, `doc_id`, `operation`, `result`, and contextual metadata.
+
+---
+
 ## Conclusion
 Our project architecture provides concrete, production-grade implementations for each of these 10 areas, balancing lightweight local edge constraints (running smoothly on Apple Silicon with 16 GB RAM) with enterprise-level robustness.
