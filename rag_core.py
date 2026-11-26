@@ -6957,17 +6957,28 @@ class GuardrailEngine:
         self,
         retrieved_chunks: List[Dict[str, Any]],
         query: Optional[str] = None,
-        modality: Optional[str] = None
+        modality: Optional[str] = None,
+        threshold: Optional[float] = None,
+        min_evidence_coverage: Optional[float] = None
     ) -> Tuple[bool, str]:
         """
-        Evaluates retrieval confidence and evidence sufficiency.
-        Fully backward-compatible: accepts (retrieved_chunks), (retrieved_chunks, query),
-        or (retrieved_chunks, query, modality).
+        Evaluates retrieval confidence and evidence sufficiency using request-local thresholds.
+        Thread-safe under concurrent requests: does not mutate shared GuardrailEngine state.
+
+        Args:
+            retrieved_chunks: List of retrieved evidence chunk dictionaries.
+            query: Optional query string for query-aware evidence coverage analysis.
+            modality: Optional explicit modality tag ('dense', 'bm25', 'rrf', 'reranker').
+            threshold: Optional request-local similarity threshold overriding min_similarity_threshold.
+            min_evidence_coverage: Optional request-local evidence coverage ratio overriding engine default.
         """
         if not retrieved_chunks:
             return False, "Guardrail Triggered: No context returned."
 
         max_score = max(c.get("score", 0.0) for c in retrieved_chunks)
+
+        # Determine effective request-local threshold for dense similarity
+        effective_min_sim = threshold if threshold is not None else self.min_similarity_threshold
 
         # 1. Modality-Aware Score Gating (calibrates across RRF, BM25, Dense, Cross-Encoder)
         detected_modality = modality
@@ -6988,12 +6999,16 @@ class GuardrailEngine:
                 return False, f"Guardrail Triggered: Re-ranker confidence ({max_score:.3f}) below threshold ({self.reranker_threshold})."
         else:
             # Dense cosine or normalized score scale
-            if max_score < self.min_similarity_threshold:
-                return False, f"Guardrail Triggered: Retrieval confidence ({max_score:.3f}) below threshold ({self.min_similarity_threshold})."
+            if max_score < effective_min_sim:
+                return False, f"Guardrail Triggered: Retrieval confidence ({max_score:.3f}) below threshold ({effective_min_sim})."
 
         # 2. Query-Aware Evidence Coverage Check (if query provided)
         if query:
-            coverage_ok, cov_reason = self.check_evidence_coverage(query, retrieved_chunks)
+            coverage_ok, cov_reason = self.check_evidence_coverage(
+                query,
+                retrieved_chunks,
+                min_coverage=min_evidence_coverage
+            )
             if not coverage_ok:
                 return False, f"Guardrail Triggered: {cov_reason}"
 
@@ -7002,12 +7017,14 @@ class GuardrailEngine:
     def check_evidence_coverage(
         self,
         query: str,
-        retrieved_chunks: List[Dict[str, Any]]
+        retrieved_chunks: List[Dict[str, Any]],
+        min_coverage: Optional[float] = None
     ) -> Tuple[bool, str]:
         """
         Evaluates whether the retrieved chunks contain key factual entities from the query.
         Guards against false acceptance of irrelevant chunks that achieved borderline scores.
         """
+        effective_min_cov = min_coverage if min_coverage is not None else self.min_evidence_coverage
         stopwords = {
             "what", "is", "the", "a", "an", "in", "of", "and", "or", "how", "where",
             "who", "when", "which", "can", "could", "should", "does", "do", "tell",
@@ -7023,8 +7040,8 @@ class GuardrailEngine:
         matching_words = [w for w in query_words if w in context_words]
         coverage_ratio = len(matching_words) / len(query_words)
 
-        if coverage_ratio < self.min_evidence_coverage:
-            return False, f"Insufficient evidence coverage ({coverage_ratio:.1%} < {self.min_evidence_coverage:.1%}). Missing key terms: {set(query_words) - context_words}"
+        if coverage_ratio < effective_min_cov:
+            return False, f"Insufficient evidence coverage ({coverage_ratio:.1%} < {effective_min_cov:.1%}). Missing key terms: {set(query_words) - context_words}"
 
         return True, "Passed"
 

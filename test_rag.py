@@ -5089,5 +5089,146 @@ class TestHybridRetrievalCacheKeyIsolation(unittest.TestCase):
         self.assertEqual([r["chunk_id"] for r in res1], [r["chunk_id"] for r in res2])
 
 
+class TestRequestLocalGuardedThresholdIntegrity(unittest.TestCase):
+    """
+    Test suite verifying that /generate-guarded and GuardrailEngine.evaluate_retrieval
+    use request-local threshold evaluation rather than mutating shared engine state:
+    1. GuardrailEngine.evaluate_retrieval(chunks, threshold=val) does not mutate engine.min_similarity_threshold.
+    2. Concurrent requests with high vs low thresholds execute concurrently without cross-talk or race conditions.
+    3. Global guardrails.min_similarity_threshold remains invariant across requests and failure cases.
+    4. Request without threshold correctly defaults to configured min_similarity_threshold.
+    """
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        from main import app, guardrails, indexer, chunker
+        self.client = TestClient(app)
+        self.guardrails = guardrails
+        self.indexer = indexer
+        self.chunker = chunker
+        self.admin_headers = {"Authorization": "Bearer admin-token"}
+
+        # Ensure benchmark doc exists
+        self.indexer.stage_and_commit_document(
+            doc_id="doc_consensus_spec",
+            text="Distributed Paxos protocol ensures cluster quorum agreement across nodes under network partitions.",
+            title="Consensus Spec",
+            chunker=self.chunker
+        )
+
+    def test_guardrail_01_request_local_threshold_does_not_mutate_engine(self):
+        """Passing request-local threshold evaluates locally without modifying engine instance."""
+        from rag_core import GuardrailEngine
+        engine = GuardrailEngine(min_similarity_threshold=0.25)
+        mock_chunks = [{"score": 0.40, "text": "Paxos consensus algorithm.", "modality": "dense"}]
+
+        # Request-local threshold 0.90 -> should fail
+        passed_strict, reason_strict = engine.evaluate_retrieval(mock_chunks, threshold=0.90)
+        self.assertFalse(passed_strict)
+        self.assertIn("0.9", reason_strict)
+        self.assertEqual(engine.min_similarity_threshold, 0.25, "engine.min_similarity_threshold must not be mutated")
+
+        # Request-local threshold 0.10 -> should pass
+        passed_lenient, reason_lenient = engine.evaluate_retrieval(mock_chunks, threshold=0.10)
+        self.assertTrue(passed_lenient)
+        self.assertEqual(engine.min_similarity_threshold, 0.25, "engine.min_similarity_threshold must remain unchanged")
+
+    def test_guardrail_02_concurrent_guarded_requests_with_divergent_thresholds(self):
+        """Concurrent requests with disparate thresholds do not leak or overwrite each other."""
+        initial_threshold = self.guardrails.min_similarity_threshold
+
+        results = {}
+
+        def request_high_threshold():
+            # Extremely high threshold (0.999) -> must trigger guardrail block
+            res = self.client.post(
+                "/generate-guarded",
+                json={
+                    "query": "Distributed Paxos protocol cluster quorum",
+                    "threshold": 0.999,
+                    "use_memory": False
+                },
+                headers=self.admin_headers
+            )
+            results["high"] = res.json()
+
+        def request_low_threshold():
+            # Extremely low threshold (0.001) -> must pass guardrail
+            res = self.client.post(
+                "/generate-guarded",
+                json={
+                    "query": "Distributed Paxos protocol cluster quorum",
+                    "threshold": 0.001,
+                    "use_memory": False
+                },
+                headers=self.admin_headers
+            )
+            results["low"] = res.json()
+
+        # Run both requests concurrently in parallel threads
+        t1 = threading.Thread(target=request_high_threshold)
+        t2 = threading.Thread(target=request_low_threshold)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        # Verify high threshold was blocked
+        self.assertEqual(results["high"].get("status"), "BLOCKED_BY_GUARDRAIL")
+        self.assertIn("0.999", results["high"].get("reason", ""))
+
+        # Verify low threshold was NOT blocked by guardrail
+        self.assertNotEqual(results["low"].get("status"), "BLOCKED_BY_GUARDRAIL")
+
+        # Verify shared threshold remained completely unchanged
+        self.assertEqual(self.guardrails.min_similarity_threshold, initial_threshold)
+
+    def test_guardrail_03_default_threshold_used_when_req_threshold_is_none(self):
+        """When req.threshold is None, default engine threshold is used without side effects."""
+        initial_threshold = self.guardrails.min_similarity_threshold
+
+        res = self.client.post(
+            "/generate-guarded",
+            json={
+                "query": "Distributed Paxos protocol cluster quorum",
+                "threshold": None,
+                "use_memory": False
+            },
+            headers=self.admin_headers
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(self.guardrails.min_similarity_threshold, initial_threshold)
+
+    def test_guardrail_04_thread_safety_under_rapid_concurrent_load(self):
+        """Multiple threads concurrently calling evaluate_retrieval with varying thresholds."""
+        from rag_core import GuardrailEngine
+        engine = GuardrailEngine(min_similarity_threshold=0.30)
+        mock_chunks = [{"score": 0.50, "text": "Distributed replication log.", "modality": "dense"}]
+
+        errors = []
+
+        def worker(thread_id: int):
+            try:
+                # Odd threads use threshold 0.80 (must fail), even threads use threshold 0.20 (must pass)
+                target_threshold = 0.80 if (thread_id % 2 == 1) else 0.20
+                expected_pass = (thread_id % 2 == 0)
+                passed, _ = engine.evaluate_retrieval(mock_chunks, threshold=target_threshold)
+                if passed != expected_pass:
+                    errors.append(f"Thread {thread_id}: expected {expected_pass} but got {passed}")
+                if engine.min_similarity_threshold != 0.30:
+                    errors.append(f"Thread {thread_id}: shared threshold mutated to {engine.min_similarity_threshold}")
+            except Exception as e:
+                errors.append(f"Thread {thread_id} crashed: {e}")
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [], f"Concurrency errors detected: {errors}")
+        self.assertEqual(engine.min_similarity_threshold, 0.30)
+
+
 if __name__ == "__main__":
     unittest.main()

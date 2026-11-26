@@ -1107,12 +1107,12 @@ def generate_guarded(
         user_context=trusted_user_context
     )
     
-    # Evaluate retrieval confidence
-    threshold = req.threshold if req.threshold is not None else guardrails.min_similarity_threshold
-    orig_threshold = guardrails.min_similarity_threshold
-    guardrails.min_similarity_threshold = threshold
-    passed, reason = guardrails.evaluate_retrieval(retrieved, query=standalone_query)
-    guardrails.min_similarity_threshold = orig_threshold
+    # Evaluate retrieval confidence using request-local threshold (thread-safe, zero shared object mutation)
+    passed, reason = guardrails.evaluate_retrieval(
+        retrieved,
+        query=standalone_query,
+        threshold=req.threshold
+    )
 
     if not passed:
         answer = "I cannot answer this based on the provided context."
