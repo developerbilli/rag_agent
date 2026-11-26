@@ -445,5 +445,32 @@ Merely omitting raw document text from operational diagnostic endpoints is insuf
 
 ---
 
+## Production Security: Architectural Hardening & Concurrency Safety
+
+### 1. Request-Local Chunker Instances (Concurrency Race Prevention)
+- Ingestion endpoints (`/ingest`, `/ingest-folder`, `/upload`) instantiate request-local chunkers (`TextChunker(chunk_size, overlap)`) instead of mutating global singleton state.
+- Concurrent requests with custom chunk sizes can no longer race or overwrite each other's chunking configurations.
+
+### 2. Disk-Streamed File Uploads (Peak Memory Optimization)
+- Incoming file uploads stream directly into bounded temporary files on disk (`NamedTemporaryFile`), ensuring peak memory is strictly bounded to the 64 KB chunk read buffer rather than duplicating 25+ MB payloads in RAM.
+- Temporary files are unlinked and cleaned up immediately after document loading.
+
+### 3. Chunked Request Body Bounding
+- The body size enforcement middleware inspects `Content-Length` for early rejection and wraps incoming streaming ASGI `receive` messages for chunked transfer requests lacking `Content-Length`.
+- Streaming bodies exceeding `RAG_MAX_REQUEST_BODY_SIZE` are aborted with HTTP `413 Payload Too Large` before multipart buffers spool to disk or memory.
+
+### 4. API Key Role Separation & Least-Privilege Defaults
+- Support for dedicated `RAG_ADMIN_API_KEY`: when configured, grants administrative authority (`admin`, `superuser`, `data_admin`), while the shared `RAG_API_KEY` defaults to standard `user` role with `internal` clearance.
+- Operators can explicitly customize `RAG_SERVICE_ROLES` and `RAG_SERVICE_CLEARANCE` without granting broad administrative powers by default.
+
+### 5. Protected Operational Endpoints in Hosted Deployments
+- Telemetry endpoints (`/observability` and `/models-status`) can be secured in hosted deployments via `RAG_PROTECT_OPERATIONAL_METRICS=true` or `RAG_HOSTED_DEPLOYMENT=true`.
+- Unauthenticated requests in hosted environments receive HTTP 401 Unauthorized, preventing reconnaissance of internal model configurations, cache metrics, and system stats.
+
+### 6. Strict Retrieval Mode Validation
+- Unknown or unsupported `retrieval_mode` values are rejected immediately with HTTP `400 Bad Request` rather than silently falling back to hybrid retrieval, preventing misconfigured client applications from receiving unexpected rankings.
+
+---
+
 ## Conclusion
 Our project architecture provides concrete, production-grade implementations for each of these 10 areas, balancing lightweight local edge constraints (running smoothly on Apple Silicon with 16 GB RAM) with enterprise-level robustness.

@@ -166,15 +166,17 @@ UPLOAD_CHUNK_SIZE = 64 * 1024
 @app.middleware("http")
 async def enforce_request_body_size_limit(request: Request, call_next):
     """
-    Early rejection of requests that exceed server request-body limits based on Content-Length header.
-    Protects reverse proxy and application memory before request body streaming begins.
+    Early rejection of requests that exceed server request-body limits.
+    Enforces limits on both Content-Length headers and chunked/streaming request bodies.
+    Protects reverse proxy, application memory, and multipart parsers before buffer spooling.
     """
+    limits = get_upload_limits()
+    max_body = limits["max_body_size"]
+
     content_length_str = request.headers.get("content-length")
     if content_length_str:
         try:
             content_length = int(content_length_str)
-            limits = get_upload_limits()
-            max_body = limits["max_body_size"]
             if content_length > max_body:
                 return JSONResponse(
                     status_code=getattr(status, "HTTP_413_CONTENT_TOO_LARGE", 413),
@@ -182,7 +184,35 @@ async def enforce_request_body_size_limit(request: Request, call_next):
                 )
         except ValueError:
             pass
-    return await call_next(request)
+
+    # For chunked transfer or requests without Content-Length, bound incoming streaming body
+    orig_receive = request.receive
+    bytes_received = 0
+
+    async def bounded_receive():
+        nonlocal bytes_received
+        msg = await orig_receive()
+        if msg.get("type") == "http.request":
+            body = msg.get("body", b"")
+            bytes_received += len(body)
+            if bytes_received > max_body:
+                raise HTTPException(
+                    status_code=getattr(status, "HTTP_413_CONTENT_TOO_LARGE", 413),
+                    detail=f"Request entity too large: streaming body exceeds limit of {max_body} bytes."
+                )
+        return msg
+
+    request._receive = bounded_receive
+
+    try:
+        return await call_next(request)
+    except HTTPException as exc:
+        if exc.status_code == getattr(status, "HTTP_413_CONTENT_TOO_LARGE", 413):
+            return JSONResponse(
+                status_code=getattr(status, "HTTP_413_CONTENT_TOO_LARGE", 413),
+                content={"detail": exc.detail}
+            )
+        raise exc
 
 # Authentication Schemes & Server-Side Identity Layer
 api_key_header_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -409,11 +439,26 @@ async def get_current_principal(
         if registered_principal:
             return registered_principal
 
+        # Check dedicated administrative API key (RAG_ADMIN_API_KEY) for role separation
+        admin_key = os.environ.get("RAG_ADMIN_API_KEY", "").strip()
+        if admin_key and secrets.compare_digest(str(provided), str(admin_key)):
+            return AuthenticatedPrincipal(
+                principal_id=os.environ.get("RAG_ADMIN_PRINCIPAL_ID", "admin_service_account"),
+                roles=["admin", "superuser", "data_admin", "sysadmin"],
+                clearance_level="top_secret",
+                department="security",
+                auth_source="admin_rag_api_key"
+            )
+
         # Check primary configured RAG_API_KEY
         if expected:
             if secrets.compare_digest(str(provided), str(expected)):
-                service_roles = [r.strip().lower() for r in os.environ.get("RAG_SERVICE_ROLES", "admin,user").split(",") if r.strip()]
-                service_clearance = os.environ.get("RAG_SERVICE_CLEARANCE", "top_secret").strip().lower()
+                # If dedicated RAG_ADMIN_API_KEY is configured, primary key defaults to standard 'user'.
+                # Otherwise, in single-key mode, defaults to 'admin,user' unless overridden by RAG_SERVICE_ROLES.
+                default_roles = "user" if admin_key else "admin,user"
+                default_clearance = "internal" if admin_key else "top_secret"
+                service_roles = [r.strip().lower() for r in os.environ.get("RAG_SERVICE_ROLES", default_roles).split(",") if r.strip()]
+                service_clearance = os.environ.get("RAG_SERVICE_CLEARANCE", default_clearance).strip().lower()
                 return AuthenticatedPrincipal(
                     principal_id=os.environ.get("RAG_SERVICE_PRINCIPAL_ID", "primary_service_account"),
                     roles=service_roles,
@@ -580,6 +625,21 @@ class QueryRequest(BaseModel):
     is_untrusted_source: Optional[bool] = False
 
 
+VALID_RETRIEVAL_MODES = {
+    "hybrid": "hybrid",
+    "rrf": "hybrid",
+    "dense_bm25": "hybrid",
+    "default": "hybrid",
+    "dense": "dense",
+    "vector": "dense",
+    "semantic": "dense",
+    "cosine": "dense",
+    "bm25": "bm25",
+    "lexical": "bm25",
+    "keyword": "bm25",
+}
+
+
 def resolve_retrieval_mode(req_mode: Optional[str] = None) -> str:
     """
     Resolves the authoritative retrieval mode from request or environment configuration.
@@ -587,16 +647,25 @@ def resolve_retrieval_mode(req_mode: Optional[str] = None) -> str:
     - 'hybrid' (default): BM25 lexical + Dense vector + Reciprocal Rank Fusion (RRF)
     - 'dense': Dense vector cosine similarity search
     - 'bm25': BM25 Okapi lexical keyword search
+
+    Validation:
+    Raises HTTPException 400 if an unknown or invalid retrieval mode is supplied,
+    preventing silent unintended fallbacks.
     """
+    if req_mode is not None and req_mode.strip():
+        raw = req_mode.strip().lower()
+        if raw not in VALID_RETRIEVAL_MODES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid retrieval_mode '{req_mode}'. Allowed modes are 'hybrid', 'dense', 'bm25'."
+            )
+        return VALID_RETRIEVAL_MODES[raw]
+
     configured = os.environ.get("RAG_DEFAULT_RETRIEVAL_MODE", "hybrid").strip().lower()
-    raw = (req_mode or configured).strip().lower()
-    if raw in ("hybrid", "rrf", "dense_bm25", "default"):
+    if configured not in VALID_RETRIEVAL_MODES:
+        logger.warning(f"Invalid RAG_DEFAULT_RETRIEVAL_MODE '{configured}'. Falling back to 'hybrid'.")
         return "hybrid"
-    elif raw in ("dense", "vector", "cosine"):
-        return "dense"
-    elif raw in ("bm25", "lexical", "keyword"):
-        return "bm25"
-    return "hybrid"
+    return VALID_RETRIEVAL_MODES[configured]
 
 
 def execute_configured_retrieval(
@@ -747,9 +816,43 @@ def serve_ui(request: Request):
     return HTMLResponse("<h2>Tiny RAG Studio UI file not found.</h2>", status_code=404)
 
 
+def is_operational_metrics_protection_enabled() -> bool:
+    """
+    Returns whether operational telemetry and model status endpoints are protected.
+    Configured via RAG_PROTECT_OPERATIONAL_METRICS=true or RAG_HOSTED_DEPLOYMENT=true.
+    When enabled, /observability and /models-status require authenticated principal credentials.
+    """
+    return (
+        os.environ.get("RAG_PROTECT_OPERATIONAL_METRICS", "").strip().lower() in ("true", "1", "yes") or
+        os.environ.get("RAG_HOSTED_DEPLOYMENT", "").strip().lower() in ("true", "1", "yes")
+    )
+
+
 @public_router.get("/observability")
-def get_observability_metrics():
-    """Returns operational dashboard metrics including P50/P90/P95 latencies, QPS, cache hit rates, guardrails, and document states."""
+async def get_observability_metrics(request: Request):
+    """
+    Returns operational dashboard metrics including P50/P90/P95 latencies, QPS, cache hit rates, guardrails, and document states.
+    In hosted deployments (RAG_PROTECT_OPERATIONAL_METRICS=true), enforces authentication.
+    """
+    if is_operational_metrics_protection_enabled():
+        # Authenticate request when protection is enabled
+        cred = request.headers.get("x-api-key") or request.headers.get("authorization")
+        if not cred:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized: Access to operational observability metrics requires authentication in hosted deployments.",
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+        bearer = None
+        if request.headers.get("authorization"):
+            parts = request.headers.get("authorization", "").split(" ")
+            if len(parts) == 2 and parts[0].lower() == "bearer":
+                bearer = HTTPAuthorizationCredentials(scheme="Bearer", credentials=parts[1])
+        await verify_api_key(await get_current_principal(
+            request=request,
+            header_key=request.headers.get("x-api-key"),
+            bearer_token=bearer
+        ))
     return dashboard.get_metrics(indexer)
 
 
@@ -762,8 +865,29 @@ def get_health_status():
 
 
 @public_router.get("/models-status")
-def models_status():
-    """Returns status of local Ollama, Gemini API, and index stats."""
+async def models_status(request: Request):
+    """
+    Returns status of local Ollama, Gemini API, and index stats.
+    In hosted deployments (RAG_PROTECT_OPERATIONAL_METRICS=true), enforces authentication.
+    """
+    if is_operational_metrics_protection_enabled():
+        cred = request.headers.get("x-api-key") or request.headers.get("authorization")
+        if not cred:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized: Access to system models status requires authentication in hosted deployments.",
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+        bearer = None
+        if request.headers.get("authorization"):
+            parts = request.headers.get("authorization", "").split(" ")
+            if len(parts) == 2 and parts[0].lower() == "bearer":
+                bearer = HTTPAuthorizationCredentials(scheme="Bearer", credentials=parts[1])
+        await verify_api_key(await get_current_principal(
+            request=request,
+            header_key=request.headers.get("x-api-key"),
+            bearer_token=bearer
+        ))
     ollama_status = LLMGenerator.check_ollama_status()
     gemini_status = LLMGenerator.check_gemini_status()
     active_docs = 0
@@ -846,8 +970,11 @@ def ingest_documents(
             detail="Access denied: Administrative or data_admin privileges required to ingest documents directly."
         )
 
-    chunker.chunk_size = req.chunk_size or 150
-    chunker.overlap = req.overlap or 30
+    # Request-local chunker prevents concurrency race condition across requests
+    request_chunker = TextChunker(
+        chunk_size=req.chunk_size or 150,
+        overlap=req.overlap or 30
+    )
 
     results = []
     total_chunks_created = 0
@@ -864,7 +991,7 @@ def ingest_documents(
             doc_id=doc.doc_id,
             text=doc.text,
             title=doc.title,
-            chunker=chunker,
+            chunker=request_chunker,
             metadata=doc_meta
         )
         results.append(res)
@@ -900,19 +1027,93 @@ async def read_bounded_upload_file(
     file: UploadFile,
     max_file_size: int,
     chunk_size: int = 64 * 1024,
-    remaining_request_budget: Optional[int] = None
-) -> Tuple[Optional[bytes], int, Optional[str]]:
+    remaining_request_budget: Optional[int] = None,
+    stream_to_disk: bool = True,
+    suffix: str = ""
+) -> Tuple[Optional[Union[str, bytes]], int, Optional[str]]:
     """
-    Streams and reads an UploadFile in bounded chunks without buffering full content into memory.
+    Streams and reads an UploadFile in bounded chunks.
+    When stream_to_disk=True (default), writes directly to a temporary file on disk,
+    bounding peak memory strictly to chunk_size (64 KB) instead of duplicating the entire file buffer in RAM.
     Aborts immediately as soon as max_file_size or remaining_request_budget is exceeded.
     Returns:
-        (content_bytes, bytes_read, error_message)
-    If a limit is exceeded, content_bytes is None to immediately free memory, and bytes_read
-    reflects the amount read prior to early abort.
+        (content_path_or_bytes, bytes_read, error_message)
+    If a limit is exceeded, content is None and temporary resources are immediately cleaned up.
     """
-    chunks: List[bytes] = []
     total_bytes_read = 0
 
+    if stream_to_disk:
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(prefix="rag_upload_", suffix=suffix, delete=False)
+        tmp_path = tmp.name
+        try:
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+
+                chunk_len = len(chunk)
+                total_bytes_read += chunk_len
+
+                # 1. Enforce individual file size limit
+                if total_bytes_read > max_file_size:
+                    tmp.close()
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    try:
+                        await file.close()
+                    except Exception:
+                        pass
+                    return (
+                        None,
+                        total_bytes_read,
+                        f"File exceeds maximum allowed upload limit of {max_file_size} bytes (aborted early after reading {total_bytes_read} bytes)"
+                    )
+
+                # 2. Enforce cumulative request upload budget
+                if remaining_request_budget is not None and total_bytes_read > remaining_request_budget:
+                    tmp.close()
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    try:
+                        await file.close()
+                    except Exception:
+                        pass
+                    return (
+                        None,
+                        total_bytes_read,
+                        f"Cumulative request upload size exceeds maximum allowed limit of {remaining_request_budget} bytes (aborted early after reading {total_bytes_read} bytes)"
+                    )
+
+                tmp.write(chunk)
+
+            tmp.flush()
+            tmp.close()
+
+            try:
+                await file.close()
+            except Exception:
+                pass
+
+            return tmp_path, total_bytes_read, None
+        except Exception as e:
+            tmp.close()
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            try:
+                await file.close()
+            except Exception:
+                pass
+            return None, total_bytes_read, f"Streaming read error: {str(e)}"
+
+    # In-memory streaming fallback (when stream_to_disk=False)
+    chunks: List[bytes] = []
     try:
         while True:
             chunk = await file.read(chunk_size)
@@ -924,7 +1125,7 @@ async def read_bounded_upload_file(
 
             # 1. Enforce individual file size limit
             if total_bytes_read > max_file_size:
-                chunks.clear()  # Free memory immediately
+                chunks.clear()
                 try:
                     await file.close()
                 except Exception:
@@ -937,7 +1138,7 @@ async def read_bounded_upload_file(
 
             # 2. Enforce cumulative request upload budget
             if remaining_request_budget is not None and total_bytes_read > remaining_request_budget:
-                chunks.clear()  # Free memory immediately
+                chunks.clear()
                 try:
                     await file.close()
                 except Exception:
@@ -1014,90 +1215,114 @@ async def upload_files(
                 errors.append(err_msg)
                 break
 
-            content, bytes_read, read_err = await read_bounded_upload_file(
-                file=file,
-                max_file_size=max_file_size,
-                chunk_size=chunk_size,
-                remaining_request_budget=remaining_budget
-            )
-            cumulative_bytes += bytes_read
+            ext = os.path.splitext(filename)[1].lower()
+            tmp_path = None
+            try:
+                content_or_path, bytes_read, read_err = await read_bounded_upload_file(
+                    file=file,
+                    max_file_size=max_file_size,
+                    chunk_size=chunk_size,
+                    remaining_request_budget=remaining_budget,
+                    stream_to_disk=True,
+                    suffix=ext
+                )
+                cumulative_bytes += bytes_read
 
-            if read_err:
-                errors.append(f"'{filename}': {read_err}")
-                continue
+                if read_err:
+                    errors.append(f"'{filename}': {read_err}")
+                    continue
 
-            if not content:
-                errors.append(f"'{filename}': File is empty or contains no readable content")
-                continue
+                if not content_or_path:
+                    errors.append(f"'{filename}': File is empty or contains no readable content")
+                    continue
 
-            doc = DocumentLoader.load_bytes(filename, content)
-            raw_text = doc.get("text", "").strip()
-            if not raw_text:
-                errors.append(f"'{filename}': File is empty or contains unreadable/scanned content")
-                continue
+                if isinstance(content_or_path, str):
+                    tmp_path = content_or_path
+                    if os.path.getsize(tmp_path) == 0:
+                        errors.append(f"'{filename}': File is empty or contains no readable content")
+                        continue
+                    doc = DocumentLoader.load_file(tmp_path)
+                    doc["doc_id"] = re.sub(r'[^a-zA-Z0-9_\-]', '_', os.path.splitext(filename)[0])
+                    doc["title"] = filename
+                    doc["source_path"] = filename
+                else:
+                    doc = DocumentLoader.load_bytes(filename, content_or_path)
 
-            doc_id = doc["doc_id"]
+                raw_text = doc.get("text", "").strip()
+                if not raw_text:
+                    errors.append(f"'{filename}': File is empty or contains unreadable/scanned content")
+                    continue
 
-            # Document Ownership & Replacement Authorization Check
-            existing_doc = indexer.get_document_status(doc_id, include_deleted=True)
-            if existing_doc:
-                op_type = "replace"
-                existing_owner = existing_doc.get("owner_id") or existing_doc.get("metadata", {}).get("owner_id") or "system"
+                doc_id = doc["doc_id"]
 
-                # 1. Prohibit overwriting documents owned by others (system, admin, other users)
-                if not principal.is_admin() and existing_owner != principal.principal_id:
-                    dashboard.record_document_audit_event(
-                        principal_id=principal.principal_id,
-                        doc_id=doc_id,
-                        operation="overwrite_rejected",
-                        result="FORBIDDEN",
-                        details={
-                            "existing_owner": existing_owner,
-                            "filename": filename,
-                            "reason": "Caller does not own existing document"
-                        }
-                    )
-                    logger.warning(
-                        f"[Security Audit] Overwrite rejected: principal_id='{principal.principal_id}' "
-                        f"attempted to overwrite document '{doc_id}' owned by '{existing_owner}'. "
-                        f"Operation: 'upload_overwrite', Result: 'FORBIDDEN'"
-                    )
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail=f"Access denied: Document '{doc_id}' already exists and is owned by '{existing_owner}'. "
-                               f"You do not have permission to overwrite documents you do not own."
-                    )
+                # Document Ownership & Replacement Authorization Check
+                existing_doc = indexer.get_document_status(doc_id, include_deleted=True)
+                if existing_doc:
+                    op_type = "replace"
+                    existing_owner = existing_doc.get("owner_id") or existing_doc.get("metadata", {}).get("owner_id") or "system"
 
-                # 2. Separate creation from replacement: verify caller replacement privileges
-                if not principal.is_admin():
-                    allow_own = os.environ.get("RAG_ALLOW_USER_DOCUMENT_REPLACEMENT", "true").lower() in ("true", "1", "yes")
-                    if not (allow_own or any(r in ("editor", "doc_editor", "data_admin") for r in principal.roles)):
+                    # 1. Prohibit overwriting documents owned by others (system, admin, other users)
+                    if not principal.is_admin() and existing_owner != principal.principal_id:
                         dashboard.record_document_audit_event(
                             principal_id=principal.principal_id,
                             doc_id=doc_id,
                             operation="overwrite_rejected",
                             result="FORBIDDEN",
-                            details={"reason": "User lacks document replacement permission"}
+                            details={
+                                "existing_owner": existing_owner,
+                                "filename": filename,
+                                "reason": "Caller does not own existing document"
+                            }
+                        )
+                        logger.warning(
+                            f"[Security Audit] Overwrite rejected: principal_id='{principal.principal_id}' "
+                            f"attempted to overwrite document '{doc_id}' owned by '{existing_owner}'. "
+                            f"Operation: 'upload_overwrite', Result: 'FORBIDDEN'"
                         )
                         raise HTTPException(
                             status_code=status.HTTP_403_FORBIDDEN,
-                            detail=f"Access denied: Principal '{principal.principal_id}' lacks document replacement permission."
+                            detail=f"Access denied: Document '{doc_id}' already exists and is owned by '{existing_owner}'. "
+                                   f"You do not have permission to overwrite documents you do not own."
                         )
-            else:
-                op_type = "create"
 
-            doc_meta = dict(doc.get("metadata", {}))
-            doc_meta.setdefault("owner_id", principal.principal_id)
-            doc_meta.setdefault("created_by", principal.principal_id)
+                    # 2. Separate creation from replacement: verify caller replacement privileges
+                    if not principal.is_admin():
+                        allow_own = os.environ.get("RAG_ALLOW_USER_DOCUMENT_REPLACEMENT", "true").lower() in ("true", "1", "yes")
+                        if not (allow_own or any(r in ("editor", "doc_editor", "data_admin") for r in principal.roles)):
+                            dashboard.record_document_audit_event(
+                                principal_id=principal.principal_id,
+                                doc_id=doc_id,
+                                operation="overwrite_rejected",
+                                result="FORBIDDEN",
+                                details={"reason": "User lacks document replacement permission"}
+                            )
+                            raise HTTPException(
+                                status_code=status.HTTP_403_FORBIDDEN,
+                                detail=f"Access denied: Principal '{principal.principal_id}' lacks document replacement permission."
+                            )
+                else:
+                    op_type = "create"
 
-            res = indexer.stage_and_commit_document(
-                doc_id=doc["doc_id"],
-                text=raw_text,
-                title=doc["title"],
-                chunker=chunker,
-                metadata=doc_meta
-            )
-            results.append(res)
+                doc_meta = dict(doc.get("metadata", {}))
+                doc_meta.setdefault("owner_id", principal.principal_id)
+                doc_meta.setdefault("created_by", principal.principal_id)
+
+                # Request-local chunker prevents concurrency race
+                upload_chunker = TextChunker(chunk_size=200, overlap=40)
+                res = indexer.stage_and_commit_document(
+                    doc_id=doc["doc_id"],
+                    text=raw_text,
+                    title=doc["title"],
+                    chunker=upload_chunker,
+                    metadata=doc_meta
+                )
+                results.append(res)
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
 
             audit_result = "SUCCESS" if res.get("status") in ("committed", "skipped") else "FAILED"
             dashboard.record_document_audit_event(
@@ -1240,9 +1465,11 @@ def ingest_folder(
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to load folder documents: {e}")
 
-    # 6. Canonical Document Lifecycle Ingestion
-    chunker.chunk_size = req.chunk_size or 150
-    chunker.overlap = req.overlap or 30
+    # 6. Canonical Document Lifecycle Ingestion with Request-Local Chunker
+    request_chunker = TextChunker(
+        chunk_size=req.chunk_size or 150,
+        overlap=req.overlap or 30
+    )
 
     total_chunks_created = 0
     results = []
@@ -1254,7 +1481,7 @@ def ingest_folder(
             doc_id=doc["doc_id"],
             text=raw_text,
             title=doc.get("title", doc["doc_id"]),
-            chunker=chunker,
+            chunker=request_chunker,
             metadata=doc.get("metadata", {})
         )
         results.append(res)

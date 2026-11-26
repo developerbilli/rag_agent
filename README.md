@@ -232,3 +232,10 @@ The pipeline provides configurable authentication modes via `RAG_AUTH_MODE=devel
   - All conversation memory lookups across generation (`/generate-rag`, `/generate-guarded`), query classification (`/route-query`), and auto-routing (`/retrieve`) strictly enforce internal principal-scoped session IDs (`<principal_id>:<session_id>`), preventing cross-user history exposure or routing poisoning.
 - **Document-Level Authorization on Index Telemetry (`/index-status`)**:
   - Chunks and version registry entries returned by `/index-status` are strictly filtered by the authenticated principal's access context (roles, clearance, department, and lifecycle state), preventing metadata leakage (titles, classifications, department names, document IDs) of unauthorized documents to ordinary users. Full text inspection requires administrative privileges (`include_text=true`).
+- **Architectural Concurrency & Operational Hardening**:
+  - **Request-Local Chunkers**: `/ingest` and `/ingest-folder` instantiate request-scoped chunkers, eliminating state mutation races across concurrent requests.
+  - **Bounded Upload Memory**: File uploads stream chunk-by-chunk to disk temporary files, eliminating peak RAM explosion from joined byte buffers.
+  - **Chunked Transfer Bounding**: ASGI middleware counts streaming body bytes for requests lacking `Content-Length`, halting oversized payloads with HTTP 413.
+  - **API Key Role Separation**: Supports `RAG_ADMIN_API_KEY` for administrative separation of duties, ensuring shared client keys do not hold blanket superuser powers.
+  - **Hosted Operational Endpoint Protection**: Telemetry routes (`/observability`, `/models-status`) can be locked down in production with `RAG_PROTECT_OPERATIONAL_METRICS=true`.
+  - **Strict Retrieval Mode Validation**: Rejects unrecognized `retrieval_mode` values with HTTP 400 Bad Request, eliminating silent fallback behavior.

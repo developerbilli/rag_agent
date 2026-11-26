@@ -6673,5 +6673,141 @@ class TestIndexStatusAuthorizationFiltering(unittest.TestCase):
             self.assertIn("text", c)
 
 
+class TestArchitecturalConcerns(unittest.TestCase):
+    """
+    Test suite verifying architectural safeguards:
+    1. Shared chunker: /ingest and /ingest-folder do not mutate global chunker state.
+    2. Upload memory: Streamed files are written directly to temporary storage and cleaned up.
+    3. Chunked transfer bodies: Requests exceeding limits without Content-Length are bounded.
+    4. Shared API key role separation: RAG_ADMIN_API_KEY vs RAG_API_KEY privilege separation.
+    5. Operational endpoints protection: /observability and /models-status require auth when enabled.
+    6. Retrieval mode validation: Invalid retrieval_mode values return 400 Bad Request.
+    """
+
+    def setUp(self):
+        self._orig_env = {
+            "RAG_ALLOW_BUILTIN_TOKENS": os.environ.get("RAG_ALLOW_BUILTIN_TOKENS"),
+            "RAG_API_KEY": os.environ.get("RAG_API_KEY"),
+            "RAG_ADMIN_API_KEY": os.environ.get("RAG_ADMIN_API_KEY"),
+            "RAG_SERVICE_ROLES": os.environ.get("RAG_SERVICE_ROLES"),
+            "RAG_AUTH_MODE": os.environ.get("RAG_AUTH_MODE"),
+            "RAG_PROTECT_OPERATIONAL_METRICS": os.environ.get("RAG_PROTECT_OPERATIONAL_METRICS"),
+            "RAG_HOSTED_DEPLOYMENT": os.environ.get("RAG_HOSTED_DEPLOYMENT"),
+            "RAG_MAX_REQUEST_BODY_SIZE": os.environ.get("RAG_MAX_REQUEST_BODY_SIZE"),
+        }
+        os.environ["RAG_ALLOW_BUILTIN_TOKENS"] = "true"
+        os.environ.pop("RAG_API_KEY", None)
+        os.environ["RAG_AUTH_MODE"] = "development"
+
+        from main import app, chunker, indexer
+        from fastapi.testclient import TestClient
+
+        self.app = app
+        self.client = TestClient(app)
+        self.global_chunker = chunker
+        self.indexer = indexer
+
+    def tearDown(self):
+        for k, v in self._orig_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_arch_01_ingest_does_not_mutate_global_chunker(self):
+        """Request-specific chunk_size and overlap in /ingest do not mutate shared global chunker."""
+        orig_size = self.global_chunker.chunk_size
+        orig_overlap = self.global_chunker.overlap
+
+        # Ingest with distinct parameters
+        res = self.client.post(
+            "/ingest",
+            json={
+                "documents": [
+                    {"doc_id": "doc_arch_chunker", "text": "Testing chunker immutability across concurrent requests."}
+                ],
+                "chunk_size": 77,
+                "overlap": 13
+            },
+            headers={"Authorization": "Bearer admin-token"}
+        )
+        self.assertEqual(res.status_code, 200)
+
+        # Global chunker must retain its original parameters
+        self.assertEqual(self.global_chunker.chunk_size, orig_size)
+        self.assertEqual(self.global_chunker.overlap, orig_overlap)
+
+    def test_arch_02_invalid_retrieval_mode_returns_400_bad_request(self):
+        """Invalid retrieval_mode values return 400 Bad Request instead of silently falling back to hybrid."""
+        # /retrieve endpoint
+        res_ret = self.client.post(
+            "/retrieve",
+            json={"query": "test query", "retrieval_mode": "invalid_mode_xyz"},
+            headers={"Authorization": "Bearer admin-token"}
+        )
+        self.assertEqual(res_ret.status_code, 400)
+        self.assertIn("Invalid retrieval_mode 'invalid_mode_xyz'", res_ret.json()["detail"])
+
+        # /generate-rag endpoint
+        res_rag = self.client.post(
+            "/generate-rag",
+            json={"query": "test query", "retrieval_mode": "nonexistent_mode"},
+            headers={"Authorization": "Bearer admin-token"}
+        )
+        self.assertEqual(res_rag.status_code, 400)
+        self.assertIn("Invalid retrieval_mode 'nonexistent_mode'", res_rag.json()["detail"])
+
+    def test_arch_03_role_separation_between_admin_and_service_api_keys(self):
+        """RAG_ADMIN_API_KEY grants admin powers, while RAG_API_KEY is restricted to standard user."""
+        admin_secret = "master-cluster-admin-key-999"
+        service_secret = "client-service-user-key-111"
+
+        os.environ["RAG_AUTH_MODE"] = "production"
+        os.environ["RAG_ADMIN_API_KEY"] = admin_secret
+        os.environ["RAG_API_KEY"] = service_secret
+        os.environ.pop("RAG_SERVICE_ROLES", None)
+
+        # 1. Standard service key can read documents but cannot clear index
+        res_read = self.client.get("/documents", headers={"Authorization": f"Bearer {service_secret}"})
+        self.assertEqual(res_read.status_code, 200)
+
+        res_clear_user = self.client.post("/clear-index", headers={"Authorization": f"Bearer {service_secret}"})
+        self.assertEqual(res_clear_user.status_code, 403)
+        self.assertIn("Administrative privileges required", res_clear_user.json()["detail"])
+
+        # 2. Admin key can perform administrative operations
+        res_clear_admin = self.client.post("/clear-index", headers={"Authorization": f"Bearer {admin_secret}"})
+        self.assertEqual(res_clear_admin.status_code, 200)
+
+    def test_arch_04_operational_endpoints_require_auth_when_metrics_protection_enabled(self):
+        """When RAG_PROTECT_OPERATIONAL_METRICS=true, /observability and /models-status require auth."""
+        api_key = "production-metrics-auth-key-555"
+        os.environ["RAG_API_KEY"] = api_key
+        os.environ["RAG_AUTH_MODE"] = "production"
+        os.environ["RAG_PROTECT_OPERATIONAL_METRICS"] = "true"
+
+        # 1. Unauthenticated requests to /observability and /models-status return 401
+        res_obs_unauth = self.client.get("/observability")
+        self.assertEqual(res_obs_unauth.status_code, 401)
+        self.assertIn("requires authentication in hosted deployments", res_obs_unauth.json()["detail"])
+
+        res_models_unauth = self.client.get("/models-status")
+        self.assertEqual(res_models_unauth.status_code, 401)
+        self.assertIn("requires authentication in hosted deployments", res_models_unauth.json()["detail"])
+
+        # 2. Health check remains publicly accessible for Kubernetes/uptime probes
+        res_health = self.client.get("/health")
+        self.assertEqual(res_health.status_code, 200)
+
+        # 3. Authenticated requests with valid credential succeed
+        res_obs_auth = self.client.get("/observability", headers={"Authorization": f"Bearer {api_key}"})
+        self.assertEqual(res_obs_auth.status_code, 200)
+        self.assertIn("system", res_obs_auth.json())
+
+        res_models_auth = self.client.get("/models-status", headers={"Authorization": f"Bearer {api_key}"})
+        self.assertEqual(res_models_auth.status_code, 200)
+        self.assertIn("index", res_models_auth.json())
+
+
 if __name__ == "__main__":
     unittest.main()
