@@ -6848,6 +6848,57 @@ class TestArchitecturalConcerns(unittest.TestCase):
         self.assertEqual(res_models_auth.status_code, 200)
         self.assertIn("index", res_models_auth.json())
 
+    def test_operational_metrics_reject_invalid_credential(self):
+        """
+        When RAG_PROTECT_OPERATIONAL_METRICS=true in development mode without RAG_API_KEY,
+        arbitrary credentials (e.g. X-API-Key, Bearer, unsupported schemes) are strictly
+        rejected with HTTP 401 Unauthorized, never falling back to the developer principal.
+        """
+        os.environ["RAG_PROTECT_OPERATIONAL_METRICS"] = "true"
+        os.environ.pop("RAG_API_KEY", None)
+        os.environ["RAG_AUTH_MODE"] = "development"
+
+        # 1. Arbitrary X-API-Key is rejected
+        res = self.client.get("/observability", headers={"X-API-Key": "arbitrary-invalid-secret-key"})
+        self.assertEqual(res.status_code, 401)
+
+        # 2. Arbitrary Bearer token is rejected
+        res_bearer = self.client.get("/observability", headers={"Authorization": "Bearer arbitrary-invalid-secret-key"})
+        self.assertEqual(res_bearer.status_code, 401)
+
+        # 3. Arbitrary non-bearer scheme is rejected
+        res_token = self.client.get("/observability", headers={"Authorization": "Token arbitrary-key"})
+        self.assertEqual(res_token.status_code, 401)
+
+        # 4. Empty/whitespace credentials are rejected
+        res_empty = self.client.get("/observability", headers={"X-API-Key": "   "})
+        self.assertEqual(res_empty.status_code, 401)
+
+        # 5. Unauthenticated request without headers is rejected
+        res_none = self.client.get("/observability")
+        self.assertEqual(res_none.status_code, 401)
+
+        # 6. Same validation applies to /models-status
+        res_models_key = self.client.get("/models-status", headers={"X-API-Key": "arbitrary-invalid-secret-key"})
+        self.assertEqual(res_models_key.status_code, 401)
+
+        res_models_token = self.client.get("/models-status", headers={"Authorization": "Token arbitrary-key"})
+        self.assertEqual(res_models_token.status_code, 401)
+
+        res_models_none = self.client.get("/models-status")
+        self.assertEqual(res_models_none.status_code, 401)
+
+    def test_hosted_deployment_startup_fails_without_api_key(self):
+        """RAG_HOSTED_DEPLOYMENT=true fails startup if RAG_API_KEY is absent."""
+        from main import validate_auth_configuration
+        os.environ["RAG_HOSTED_DEPLOYMENT"] = "true"
+        os.environ.pop("RAG_API_KEY", None)
+        os.environ["RAG_AUTH_MODE"] = "development"
+
+        with self.assertRaises(RuntimeError) as cm:
+            validate_auth_configuration()
+        self.assertIn("RAG_HOSTED_DEPLOYMENT is active", str(cm.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

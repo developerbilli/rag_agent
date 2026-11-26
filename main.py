@@ -284,15 +284,17 @@ def validate_auth_configuration() -> None:
         raise RuntimeError(err_msg)
 
     auth_mode = get_auth_mode()
-    if auth_mode == "production":
+    is_hosted = os.environ.get("RAG_HOSTED_DEPLOYMENT", "").strip().lower() in ("true", "1", "yes")
+
+    if auth_mode == "production" or is_hosted:
         # 2. Require authoritative authentication configuration
         if not has_auth_configuration():
+            mode_desc = "RAG_HOSTED_DEPLOYMENT is active" if is_hosted and auth_mode != "production" else "RAG_AUTH_MODE is set to 'production' (or production environment detected)"
             err_msg = (
-                "Production startup failed: RAG_AUTH_MODE is set to 'production' "
-                "(or production environment detected), but no authentication configuration exists "
-                "(RAG_API_KEY is absent or empty). "
-                "Open developer mode without authentication is prohibited in production. "
-                "Set RAG_API_KEY to a secure secret, or set RAG_AUTH_MODE=development for local testing."
+                f"Production startup failed: {mode_desc}, but no authentication configuration exists "
+                f"(RAG_API_KEY is absent or empty). "
+                f"Open developer mode without authentication is prohibited in production/hosted deployments. "
+                f"Set RAG_API_KEY to a secure secret, or set RAG_AUTH_MODE=development for local testing."
             )
             logger.critical(f"[Security Startup Violation] {err_msg}")
             raise RuntimeError(err_msg)
@@ -313,6 +315,13 @@ def validate_auth_configuration() -> None:
             )
             logger.critical(f"[Security Startup Violation] {err_msg}")
             raise RuntimeError(err_msg)
+
+    if is_operational_metrics_protection_enabled() and not has_auth_configuration():
+        logger.warning(
+            "[Security Warning] RAG_PROTECT_OPERATIONAL_METRICS is enabled but RAG_API_KEY is not configured. "
+            "Operational endpoints (/observability, /models-status) will strictly reject unauthenticated access "
+            "and developer mode fallbacks."
+        )
 
 
 def are_builtin_tokens_allowed() -> bool:
@@ -401,13 +410,13 @@ async def get_current_principal(
                 pass
 
     # 2. Extract credential exclusively from headers (or fallback to legacy transport if non-prod/relaxed)
-    provided = header_key or request.headers.get("X-API-Key")
-    if not provided and bearer_token:
-        provided = bearer_token.credentials
+    provided = (header_key or request.headers.get("X-API-Key") or "").strip() or None
+    if not provided and bearer_token and bearer_token.credentials:
+        provided = bearer_token.credentials.strip() or None
     if not provided:
-        auth_header = request.headers.get("Authorization", "")
+        auth_header = request.headers.get("Authorization", "").strip()
         if auth_header.startswith("Bearer "):
-            provided = auth_header.replace("Bearer ", "").strip()
+            provided = auth_header[7:].strip() or None
 
     if not provided and not strict_header_auth:
         provided = request.query_params.get("api_key")
@@ -828,31 +837,80 @@ def is_operational_metrics_protection_enabled() -> bool:
     )
 
 
+async def require_operational_metrics_access(
+    request: Request,
+    header_key: Optional[str] = Security(api_key_header_scheme),
+    bearer_token: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme),
+) -> Optional[AuthenticatedPrincipal]:
+    """
+    Enforces authentication for operational endpoints (/observability, /models-status).
+    When operational metrics protection is disabled, permits unauthenticated public access.
+    When operational metrics protection is enabled (RAG_PROTECT_OPERATIONAL_METRICS=true or RAG_HOSTED_DEPLOYMENT=true):
+    - Requires an explicitly authenticated principal with validated credentials.
+    - Header presence alone is never accepted as proof of authentication.
+    - Rejects open developer mode fallbacks (auth_source == "developer_open_mode" or dev_user).
+    - Rejects missing, invalid, unrecognized, or unsupported credentials with HTTP 401 Unauthorized.
+    """
+    if not is_operational_metrics_protection_enabled():
+        return None
+
+    auth_header = request.headers.get("Authorization", "").strip()
+    x_api_key = (header_key or request.headers.get("X-API-Key") or "").strip()
+
+    # 1. Require a non-empty, supported credential header
+    if not x_api_key and not auth_header:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Access to operational observability metrics requires authentication in hosted deployments. Provide credentials via 'Authorization: Bearer <key>' or 'X-API-Key' headers.",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    # 2. Reject unsupported authorization schemes (e.g., Basic, Token, Custom)
+    if auth_header and not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Unsupported authorization scheme. Provide credentials via 'Authorization: Bearer <key>' or 'X-API-Key' headers.",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    # 3. Reject empty Bearer token if X-API-Key is not provided
+    if auth_header and auth_header.startswith("Bearer "):
+        token_part = auth_header[7:].strip()
+        if not token_part and not x_api_key:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized: Empty or missing Bearer token.",
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+        if token_part and not bearer_token:
+            bearer_token = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token_part)
+
+    # 4. Authenticate caller against authoritative server-side identity layer
+    principal = await get_current_principal(
+        request=request,
+        header_key=x_api_key or None,
+        bearer_token=bearer_token
+    )
+
+    # 5. Open developer mode fallback cannot access protected operational metrics
+    if not principal or getattr(principal, "auth_source", "") == "developer_open_mode" or principal.principal_id == "dev_user":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Valid operational credentials required. Open developer mode cannot access protected operational endpoints.",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    return principal
+
+
 @public_router.get("/observability")
-async def get_observability_metrics(request: Request):
+async def get_observability_metrics(
+    principal: Optional[AuthenticatedPrincipal] = Depends(require_operational_metrics_access)
+):
     """
     Returns operational dashboard metrics including P50/P90/P95 latencies, QPS, cache hit rates, guardrails, and document states.
     In hosted deployments (RAG_PROTECT_OPERATIONAL_METRICS=true), enforces authentication.
     """
-    if is_operational_metrics_protection_enabled():
-        # Authenticate request when protection is enabled
-        cred = request.headers.get("x-api-key") or request.headers.get("authorization")
-        if not cred:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized: Access to operational observability metrics requires authentication in hosted deployments.",
-                headers={"WWW-Authenticate": "Bearer"}
-            )
-        bearer = None
-        if request.headers.get("authorization"):
-            parts = request.headers.get("authorization", "").split(" ")
-            if len(parts) == 2 and parts[0].lower() == "bearer":
-                bearer = HTTPAuthorizationCredentials(scheme="Bearer", credentials=parts[1])
-        await verify_api_key(await get_current_principal(
-            request=request,
-            header_key=request.headers.get("x-api-key"),
-            bearer_token=bearer
-        ))
     return dashboard.get_metrics(indexer)
 
 
@@ -865,29 +923,13 @@ def get_health_status():
 
 
 @public_router.get("/models-status")
-async def models_status(request: Request):
+async def models_status(
+    principal: Optional[AuthenticatedPrincipal] = Depends(require_operational_metrics_access)
+):
     """
     Returns status of local Ollama, Gemini API, and index stats.
     In hosted deployments (RAG_PROTECT_OPERATIONAL_METRICS=true), enforces authentication.
     """
-    if is_operational_metrics_protection_enabled():
-        cred = request.headers.get("x-api-key") or request.headers.get("authorization")
-        if not cred:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized: Access to system models status requires authentication in hosted deployments.",
-                headers={"WWW-Authenticate": "Bearer"}
-            )
-        bearer = None
-        if request.headers.get("authorization"):
-            parts = request.headers.get("authorization", "").split(" ")
-            if len(parts) == 2 and parts[0].lower() == "bearer":
-                bearer = HTTPAuthorizationCredentials(scheme="Bearer", credentials=parts[1])
-        await verify_api_key(await get_current_principal(
-            request=request,
-            header_key=request.headers.get("x-api-key"),
-            bearer_token=bearer
-        ))
     ollama_status = LLMGenerator.check_ollama_status()
     gemini_status = LLMGenerator.check_gemini_status()
     active_docs = 0

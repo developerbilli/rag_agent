@@ -469,7 +469,9 @@ Merely omitting raw document text from operational diagnostic endpoints is insuf
 
 ### 5. Protected Operational Endpoints in Hosted Deployments
 - Telemetry endpoints (`/observability` and `/models-status`) can be secured in hosted deployments via `RAG_PROTECT_OPERATIONAL_METRICS=true` or `RAG_HOSTED_DEPLOYMENT=true`.
-- Unauthenticated requests in hosted environments receive HTTP 401 Unauthorized, preventing reconnaissance of internal model configurations, cache metrics, and system stats.
+- **Strict Credential Validation**: Protected endpoints require an explicitly validated credential via `require_operational_metrics_access`. Header presence alone is never used as proof of authentication.
+- **No Developer Mode Fallback**: Open developer mode principals (`developer_open_mode` / `dev_user`), arbitrary unrecognized headers, unsupported auth schemes (e.g., `Token`, `Basic`), and empty/whitespace credentials are unconditionally rejected with HTTP `401 Unauthorized`.
+- **Startup Enforcement**: In hosted environments (`RAG_HOSTED_DEPLOYMENT=true`) or production mode (`RAG_AUTH_MODE=production`), startup validation (`validate_auth_configuration()`) fails immediately if no authentication configuration exists (`RAG_API_KEY`), preventing unauthenticated deployment. Public health check (`/health`) remains open for orchestrator liveness probes.
 
 ### 6. Strict Retrieval Mode Validation
 - Unknown or unsupported `retrieval_mode` values are rejected immediately with HTTP `400 Bad Request` rather than silently falling back to hybrid retrieval, preventing misconfigured client applications from receiving unexpected rankings.
