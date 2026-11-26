@@ -7018,7 +7018,10 @@ class GuardrailEngine:
         if not detected_modality and retrieved_chunks:
             detected_modality = retrieved_chunks[0].get("modality") or retrieved_chunks[0].get("retrieval_modality")
 
-        if detected_modality == "rrf" or (max_score < 0.05 and any("doc_id" in c for c in retrieved_chunks)):
+        if threshold is not None:
+            if max_score < threshold:
+                return False, f"Guardrail Triggered: Retrieval score ({max_score:.3f}) below threshold ({threshold})."
+        elif detected_modality == "rrf" or (max_score < 0.05 and any("doc_id" in c for c in retrieved_chunks)):
             # Detected RRF score scale [0.005, 0.040]
             if max_score < self.rrf_threshold:
                 return False, f"Guardrail Triggered: RRF retrieval score ({max_score:.5f}) below threshold ({self.rrf_threshold})."

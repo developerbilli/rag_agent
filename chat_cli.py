@@ -44,6 +44,7 @@ class TinyRAGCLI:
         self.model = None
         self.api_key = None
         self.top_k = 3
+        self.retrieval_mode = os.environ.get("RAG_DEFAULT_RETRIEVAL_MODE", "hybrid").lower()
         self.enforce_guardrails = True
         self.conversation_manager = ConversationManager(max_history_turns=5)
         self.session_id = "cli_default"
@@ -79,6 +80,7 @@ class TinyRAGCLI:
         print(f"\n{BOLD}Available CLI Commands:{RESET}")
         print(f"  {CYAN}/ingest <path>{RESET}      Ingest a file (.pdf, .txt, .md) or whole folder")
         print(f"  {CYAN}/policy <name>{RESET}      Set execution policy ({YELLOW}strict_offline{RESET}, {YELLOW}hybrid{RESET}, {YELLOW}cloud{RESET})")
+        print(f"  {CYAN}/retriever <name>{RESET}   Set retrieval mode ({YELLOW}hybrid{RESET}, {YELLOW}dense{RESET}, {YELLOW}bm25{RESET}, current: {self.retrieval_mode})")
         print(f"  {CYAN}/mode <name>{RESET}        Set backend ({YELLOW}auto{RESET}, {YELLOW}ollama{RESET}, {YELLOW}gemini{RESET}, {YELLOW}offline{RESET})")
         print(f"  {CYAN}/model <name>{RESET}       Set model (e.g. {YELLOW}llama3.2:1b{RESET}, {YELLOW}qwen2.5:1.5b{RESET})")
         print(f"  {CYAN}/topk <int>{RESET}         Set Top-K retrieved chunks (current: {self.top_k})")
@@ -148,8 +150,19 @@ class TinyRAGCLI:
             if standalone_query.strip().lower() != query.strip().lower():
                 print(f"{DIM}🔍 Rewritten retrieval query: {CYAN}{standalone_query}{RESET}")
 
-        # 2. Search using standalone_query
-        retrieved = self.indexer.search(standalone_query, top_k=self.top_k)
+        # 2. Search using standalone_query with configured retrieval mode (hybrid, dense, bm25)
+        mode = getattr(self, "retrieval_mode", "hybrid").lower()
+        if mode == "hybrid":
+            retrieved = self.indexer.search_hybrid(standalone_query, top_k=self.top_k)
+        elif mode == "bm25":
+            if not hasattr(self.indexer, "bm25") or self.indexer.bm25 is None:
+                from rag_core import BM25OkapiIndexer
+                self.indexer.bm25 = BM25OkapiIndexer()
+                self.indexer.bm25.index(self.indexer.chunks)
+            bm25_scored = self.indexer.bm25.search(standalone_query, top_k=self.top_k)
+            retrieved = [dict(self.indexer.chunks[idx], score=sc, modality="bm25") for idx, sc in bm25_scored]
+        else:
+            retrieved = self.indexer.search(standalone_query, top_k=self.top_k)
 
         # 3. Guardrails Check
         if self.enforce_guardrails:
@@ -247,6 +260,13 @@ class TinyRAGCLI:
                         print(f"{GREEN}✓ Execution policy set to: {self.execution_mode.upper()}{RESET}")
                     else:
                         print(f"{YELLOW}Valid execution policies: strict_offline, hybrid, cloud{RESET}")
+                elif cmd in ("/retriever", "/retrieval"):
+                    r_mode = arg.lower().strip()
+                    if r_mode in ("hybrid", "dense", "bm25"):
+                        self.retrieval_mode = r_mode
+                        print(f"{GREEN}✓ Retrieval mode set to: {self.retrieval_mode.upper()}{RESET}")
+                    else:
+                        print(f"{YELLOW}Valid retrieval modes: hybrid, dense, bm25{RESET}")
                 elif cmd == "/mode":
                     if arg.lower() in ("auto", "ollama", "gemini", "offline"):
                         self.backend = arg.lower()

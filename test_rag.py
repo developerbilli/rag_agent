@@ -5714,5 +5714,225 @@ class TestHeaderAuthenticationAndLogRedaction(unittest.TestCase):
         self.assertEqual(redacted["Accept"], "*/*")
 
 
+class TestHybridRetrievalWiringAndAPIIntegration(unittest.TestCase):
+    """
+    Integration test suite verifying that hybrid retrieval (BM25 + Dense + RRF)
+    is directly wired into the main RAG API routes:
+    - POST /retrieve routes through indexer.search_hybrid()
+    - POST /generate-rag routes through indexer.search_hybrid()
+    - POST /generate-guarded routes through indexer.search_hybrid()
+    - Explicit retrieval_mode switching ('hybrid', 'dense', 'bm25')
+    - Proves that both Dense and BM25 search engines execute during the HTTP request
+    - Proves exact keyword matching is elevated to Rank 1 via RRF in end-to-end API generation
+    """
+
+    def setUp(self):
+        self.env_backup = {
+            "RAG_DEFAULT_RETRIEVAL_MODE": os.environ.get("RAG_DEFAULT_RETRIEVAL_MODE"),
+            "RAG_API_KEY": os.environ.get("RAG_API_KEY"),
+            "RAG_ALLOW_BUILTIN_TOKENS": os.environ.get("RAG_ALLOW_BUILTIN_TOKENS"),
+        }
+        os.environ["RAG_ALLOW_BUILTIN_TOKENS"] = "true"
+        os.environ.pop("RAG_API_KEY", None)
+
+        from fastapi.testclient import TestClient
+        from main import app, indexer, chunker
+        self.app = app
+        self.client = TestClient(app)
+        self.indexer = indexer
+        self.chunker = chunker
+        self.admin_headers = {"Authorization": "Bearer admin-token"}
+
+        # Ensure sample docs are present
+        from main import auto_ingest_sample_corpus
+        if not any(c.get("doc_id") == "doc_rag_overview" for c in self.indexer.chunks):
+            auto_ingest_sample_corpus()
+
+    def tearDown(self):
+        for k, v in self.env_backup.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+
+    def test_api_01_retrieve_routes_to_hybrid_bm25_dense_rrf(self):
+        """POST /retrieve routes through indexer.search_hybrid() engaging both Dense and BM25 with RRF."""
+        import unittest.mock as mock
+
+        with mock.patch.object(self.indexer, "search_hybrid", wraps=self.indexer.search_hybrid) as spy_hybrid:
+            res = self.client.post(
+                "/retrieve",
+                json={
+                    "query": "Retrieval-Augmented Generation",
+                    "retrieval_mode": "hybrid",
+                    "top_k": 3
+                },
+                headers=self.admin_headers
+            )
+            self.assertEqual(res.status_code, 200)
+            data = res.json()
+
+            # 1. API explicitly returns retrieval_mode = hybrid
+            self.assertEqual(data.get("retrieval_mode"), "hybrid")
+            # 2. search_hybrid was invoked with the query
+            self.assertTrue(spy_hybrid.called)
+            self.assertEqual(spy_hybrid.call_args[1]["query"], "Retrieval-Augmented Generation")
+            # 3. Chunks carry modality 'rrf'
+            retrieved = data.get("retrieved_chunks", [])
+            self.assertGreater(len(retrieved), 0)
+            self.assertEqual(retrieved[0].get("modality"), "rrf")
+
+    def test_api_02_generate_rag_routes_to_hybrid_retriever(self):
+        """POST /generate-rag executes hybrid search and feeds RRF fused evidence into generator."""
+        import unittest.mock as mock
+
+        with mock.patch.object(self.indexer, "search_hybrid", wraps=self.indexer.search_hybrid) as spy_hybrid:
+            res = self.client.post(
+                "/generate-rag",
+                json={
+                    "query": "How does RAG optimize output?",
+                    "retrieval_mode": "hybrid",
+                    "use_memory": False
+                },
+                headers=self.admin_headers
+            )
+            self.assertEqual(res.status_code, 200)
+            data = res.json()
+
+            self.assertEqual(data.get("retrieval_mode"), "hybrid")
+            self.assertTrue(spy_hybrid.called)
+            self.assertGreater(len(data.get("retrieved_chunks", [])), 0)
+            self.assertEqual(data["retrieved_chunks"][0].get("modality"), "rrf")
+            self.assertTrue(data.get("grounded"))
+            self.assertIn("answer", data)
+
+    def test_api_03_generate_guarded_routes_to_hybrid_retriever(self):
+        """POST /generate-guarded executes hybrid search and calibrates confidence against RRF scores."""
+        import unittest.mock as mock
+
+        with mock.patch.object(self.indexer, "search_hybrid", wraps=self.indexer.search_hybrid) as spy_hybrid:
+            res = self.client.post(
+                "/generate-guarded",
+                json={
+                    "query": "Retrieval-Augmented Generation",
+                    "retrieval_mode": "hybrid",
+                    "use_memory": False
+                },
+                headers=self.admin_headers
+            )
+            self.assertEqual(res.status_code, 200)
+            data = res.json()
+
+            self.assertEqual(data.get("retrieval_mode"), "hybrid")
+            self.assertTrue(spy_hybrid.called)
+            self.assertEqual(data.get("status"), "PASSED")
+            self.assertGreater(len(data.get("retrieved_chunks", [])), 0)
+            self.assertEqual(data["retrieved_chunks"][0].get("modality"), "rrf")
+
+    def test_api_04_explicit_mode_switching_dense_and_bm25(self):
+        """API endpoints switch cleanly between 'dense', 'bm25', and 'hybrid' modes based on request."""
+        # 1. Explicit dense mode
+        res_dense = self.client.post(
+            "/retrieve",
+            json={
+                "query": "Retrieval-Augmented Generation",
+                "retrieval_mode": "dense",
+                "top_k": 2
+            },
+            headers=self.admin_headers
+        )
+        self.assertEqual(res_dense.status_code, 200)
+        data_dense = res_dense.json()
+        self.assertEqual(data_dense.get("retrieval_mode"), "dense")
+        self.assertNotEqual(data_dense["retrieved_chunks"][0].get("modality"), "rrf")
+
+        # 2. Explicit bm25 mode
+        res_bm25 = self.client.post(
+            "/retrieve",
+            json={
+                "query": "Retrieval-Augmented Generation",
+                "retrieval_mode": "bm25",
+                "top_k": 2
+            },
+            headers=self.admin_headers
+        )
+        self.assertEqual(res_bm25.status_code, 200)
+        data_bm25 = res_bm25.json()
+        self.assertEqual(data_bm25.get("retrieval_mode"), "bm25")
+        self.assertEqual(data_bm25["retrieved_chunks"][0].get("modality"), "bm25")
+
+    def test_api_05_hybrid_retrieval_elevates_exact_keyword_over_dense_via_rrf(self):
+        """End-to-end API test proving BM25 + dense + RRF elevates exact technical keywords to Rank 1."""
+        # Clear index to test exact keyword boost
+        self.client.post("/clear-index", headers=self.admin_headers)
+
+        # Ingest two documents
+        doc_dense = {
+            "doc_id": "doc_general_db",
+            "title": "General Database Systems",
+            "text": "Distributed consensus protocols coordinate transactions and state machine replication across clustered network nodes."
+        }
+        doc_keyword = {
+            "doc_id": "doc_kyber_handshake",
+            "title": "Post Quantum Cryptography",
+            "text": "The protocol enforces KYBER768_POST_QUANTUM_HANDSHAKE_ID_9999 for ephemeral lattice authenticated key exchange."
+        }
+        ingest_res = self.client.post(
+            "/ingest",
+            json={"documents": [doc_dense, doc_keyword]},
+            headers=self.admin_headers
+        )
+        self.assertEqual(ingest_res.status_code, 200)
+
+        # Query using the exact technical token
+        query = "KYBER768_POST_QUANTUM_HANDSHAKE_ID_9999"
+
+        # 1. Retrieve via hybrid mode
+        res_hybrid = self.client.post(
+            "/retrieve",
+            json={
+                "query": query,
+                "retrieval_mode": "hybrid",
+                "top_k": 1
+            },
+            headers=self.admin_headers
+        )
+        self.assertEqual(res_hybrid.status_code, 200)
+        chunks_hybrid = res_hybrid.json().get("retrieved_chunks", [])
+        self.assertEqual(len(chunks_hybrid), 1)
+        # RRF fused scoring elevates the keyword document to Rank 1
+        self.assertEqual(chunks_hybrid[0]["doc_id"], "doc_kyber_handshake")
+        self.assertEqual(chunks_hybrid[0]["modality"], "rrf")
+
+        # 2. Generate via hybrid mode
+        res_gen = self.client.post(
+            "/generate-rag",
+            json={
+                "query": query,
+                "retrieval_mode": "hybrid",
+                "use_memory": False
+            },
+            headers=self.admin_headers
+        )
+        self.assertEqual(res_gen.status_code, 200)
+        data_gen = res_gen.json()
+        self.assertEqual(data_gen["retrieved_chunks"][0]["doc_id"], "doc_kyber_handshake")
+        self.assertTrue(any("doc_kyber_handshake" in p for p in data_gen["provenance"]))
+
+    def test_api_06_default_configuration_routes_to_hybrid_when_mode_omitted(self):
+        """When retrieval_mode is omitted from request, environment default (RAG_DEFAULT_RETRIEVAL_MODE=hybrid) is used."""
+        os.environ["RAG_DEFAULT_RETRIEVAL_MODE"] = "hybrid"
+
+        res = self.client.post(
+            "/retrieve",
+            json={"query": "Retrieval-Augmented Generation", "top_k": 2},
+            headers=self.admin_headers
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data.get("retrieval_mode"), "hybrid")
+        self.assertEqual(data["retrieved_chunks"][0].get("modality"), "rrf")
+
+
 if __name__ == "__main__":
     unittest.main()

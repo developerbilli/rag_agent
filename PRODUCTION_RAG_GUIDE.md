@@ -266,6 +266,38 @@ flowchart TD
 
 ---
 
+## Production Architecture: Explicit Hybrid Retrieval Routing in the RAG API
+
+In production RAG systems, retrieval cannot rely solely on semantic dense embeddings or keyword search in isolation:
+- **Dense Cosine Retrieval**: Excels at semantic concepts, synonyms, and generalized matching, but fails on out-of-vocabulary technical identifiers, exact codes, error messages, and acronyms.
+- **BM25 Lexical Retrieval**: Excels at exact string tokens and unique domain keywords, but misses semantic paraphrasing.
+- **Hybrid RRF Fusion**: Combines rankings from both dense and lexical retrievers using Reciprocal Rank Fusion ($Score = \sum \frac{w_i}{k + rank_i}$), providing superior recall across diverse queries.
+
+### API Request Schema & Routing (`main.py`):
+Every RAG generation route (`/retrieve`, `/generate-rag`, and `/generate-guarded`) explicitly supports configurable retrieval modes:
+
+```json
+{
+  "query": "RAFT_LEADER_HEARTBEAT_ACK_TIMEOUT_999",
+  "top_k": 3,
+  "retrieval_mode": "hybrid",
+  "alpha": 0.5,
+  "use_reranker": false,
+  "rrf_k": 60,
+  "weight_dense": 0.5,
+  "weight_bm25": 0.5,
+  "candidate_multiplier": 5
+}
+```
+
+- **Supported Modes**:
+  - `"hybrid"` (default via `RAG_DEFAULT_RETRIEVAL_MODE=hybrid`): Dispatches to `indexer.search_hybrid()`, querying dense embeddings, BM25 Okapi index, and combining rank positions via RRF.
+  - `"dense"`: Dispatches to `indexer.search()` for vector-only cosine similarity.
+  - `"bm25"`: Dispatches to `indexer.bm25.search()` for lexical Okapi search with RBAC/ABAC pre-filtering.
+- **Response Diagnostics**: Responses from `/retrieve`, `/generate-rag`, and `/generate-guarded` return `"retrieval_mode": "hybrid"`, with retrieved chunks carrying `"modality": "rrf"`.
+
+---
+
 ## Production Security: Reverse Proxy & Gateway Request-Body Limits (DoS Mitigation)
 
 In enterprise deployments, file uploads must be defended at multiple infrastructure layers to prevent denial-of-service (DoS) memory exhaustion:

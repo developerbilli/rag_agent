@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Header, Q
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union, Set
 
 logger = logging.getLogger("rag_api.auth")
 
@@ -100,7 +100,9 @@ from rag_core import (
     OperationalObservabilityDashboard,
     StrictOfflineGuard,
     AuthenticatedPrincipal,
-    PrincipalRegistry
+    PrincipalRegistry,
+    MetadataFilterEngine,
+    BM25OkapiIndexer
 )
 
 app = FastAPI(
@@ -446,6 +448,13 @@ class IngestFolderRequest(BaseModel):
 class QueryRequest(BaseModel):
     query: str
     top_k: Optional[int] = 3
+    retrieval_mode: Optional[str] = None  # "hybrid" (default in production), "dense", "bm25"
+    alpha: Optional[float] = 0.5
+    use_reranker: Optional[Union[bool, str]] = False
+    rrf_k: Optional[int] = 60
+    weight_dense: Optional[float] = None
+    weight_bm25: Optional[float] = None
+    candidate_multiplier: Optional[int] = 5
     backend: Optional[str] = "auto"
     execution_mode: Optional[str] = "strict_offline"
     model: Optional[str] = None
@@ -459,6 +468,96 @@ class QueryRequest(BaseModel):
     auto_route: Optional[bool] = False
     small_model_mode: Optional[bool] = False
     is_untrusted_source: Optional[bool] = False
+
+
+def resolve_retrieval_mode(req_mode: Optional[str] = None) -> str:
+    """
+    Resolves the authoritative retrieval mode from request or environment configuration.
+    Allowed modes:
+    - 'hybrid' (default): BM25 lexical + Dense vector + Reciprocal Rank Fusion (RRF)
+    - 'dense': Dense vector cosine similarity search
+    - 'bm25': BM25 Okapi lexical keyword search
+    """
+    configured = os.environ.get("RAG_DEFAULT_RETRIEVAL_MODE", "hybrid").strip().lower()
+    raw = (req_mode or configured).strip().lower()
+    if raw in ("hybrid", "rrf", "dense_bm25", "default"):
+        return "hybrid"
+    elif raw in ("dense", "vector", "cosine"):
+        return "dense"
+    elif raw in ("bm25", "lexical", "keyword"):
+        return "bm25"
+    return "hybrid"
+
+
+def execute_configured_retrieval(
+    indexer: VectorIndexer,
+    query: str,
+    top_k: int = 3,
+    retrieval_mode: Optional[str] = None,
+    alpha: float = 0.5,
+    use_reranker: Union[bool, str] = False,
+    rrf_k: int = 60,
+    weight_dense: Optional[float] = None,
+    weight_bm25: Optional[float] = None,
+    candidate_multiplier: int = 5,
+    filters: Optional[Dict[str, Any]] = None,
+    user_context: Optional[Dict[str, Any]] = None
+) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Executes context retrieval according to the resolved retrieval mode:
+    - 'hybrid': Routes to indexer.search_hybrid(...) via BM25 + Dense + RRF (+ optional re-ranking)
+    - 'dense': Routes to indexer.search(...) via Dense cosine similarity
+    - 'bm25': Routes to indexer.bm25 via Okapi lexical search with RBAC/ABAC filtering
+    Returns:
+        (retrieved_chunks, mode_used)
+    """
+    mode = resolve_retrieval_mode(retrieval_mode)
+
+    if mode == "hybrid":
+        results = indexer.search_hybrid(
+            query=query,
+            top_k=top_k,
+            alpha=alpha,
+            use_reranker=use_reranker,
+            rrf_k=rrf_k,
+            weight_dense=weight_dense,
+            weight_bm25=weight_bm25,
+            candidate_multiplier=candidate_multiplier,
+            filters=filters,
+            user_context=user_context
+        )
+        return results, "hybrid"
+
+    elif mode == "bm25":
+        deleted_docs = {
+            k for k, v in getattr(indexer, 'source_documents', {}).items()
+            if v.get("status") == "deleted" or bool(v.get("deleted"))
+        }
+        valid_set = {
+            i for i, c in enumerate(indexer.chunks)
+            if c.get("doc_id") not in deleted_docs and MetadataFilterEngine.matches(c, filters, user_context)
+        }
+        if not hasattr(indexer, 'bm25') or indexer.bm25 is None:
+            indexer.bm25 = BM25OkapiIndexer()
+            indexer.bm25.index(indexer.chunks)
+        bm25_scored = indexer.bm25.search(query, top_k=top_k, allowed_indices=valid_set)
+        results = []
+        for idx, sc in bm25_scored:
+            item = dict(indexer.chunks[idx])
+            item["score"] = sc
+            item["modality"] = "bm25"
+            results.append(item)
+        return results, "bm25"
+
+    else:
+        # Dense vector search
+        results = indexer.search(
+            query=query,
+            top_k=top_k,
+            filters=filters,
+            user_context=user_context
+        )
+        return results, "dense"
 
 
 class EvalItem(BaseModel):
@@ -1276,17 +1375,26 @@ def retrieve_context(
             "tool_output": route_exec.get("tool_output")
         }
 
-    results = indexer.search(
-        req.query,
+    results, mode_used = execute_configured_retrieval(
+        indexer=indexer,
+        query=req.query,
         top_k=req.top_k or 3,
+        retrieval_mode=req.retrieval_mode,
+        alpha=req.alpha if req.alpha is not None else 0.5,
+        use_reranker=req.use_reranker if req.use_reranker is not None else False,
+        rrf_k=req.rrf_k if req.rrf_k is not None else 60,
+        weight_dense=req.weight_dense,
+        weight_bm25=req.weight_bm25,
+        candidate_multiplier=req.candidate_multiplier if req.candidate_multiplier is not None else 5,
         filters=req.filters,
         user_context=trusted_user_context
     )
     lat_ms = (time.perf_counter() - t0) * 1000.0
-    dashboard.record_request("/retrieve", route="dense", latency_ms=lat_ms)
+    dashboard.record_request("/retrieve", route=mode_used, latency_ms=lat_ms)
     return {
         "query": req.query,
         "top_k": req.top_k,
+        "retrieval_mode": mode_used,
         "retrieved_chunks": results
     }
 
@@ -1319,9 +1427,17 @@ def generate_rag(
             )
 
     # 2. Retrieval using standalone condensed query & trusted user_context
-    retrieved = indexer.search(
-        standalone_query,
+    retrieved, mode_used = execute_configured_retrieval(
+        indexer=indexer,
+        query=standalone_query,
         top_k=req.top_k or 3,
+        retrieval_mode=req.retrieval_mode,
+        alpha=req.alpha if req.alpha is not None else 0.5,
+        use_reranker=req.use_reranker if req.use_reranker is not None else False,
+        rrf_k=req.rrf_k if req.rrf_k is not None else 60,
+        weight_dense=req.weight_dense,
+        weight_bm25=req.weight_bm25,
+        candidate_multiplier=req.candidate_multiplier if req.candidate_multiplier is not None else 5,
         filters=req.filters,
         user_context=trusted_user_context
     )
@@ -1362,6 +1478,7 @@ def generate_rag(
         "phase": "Phase 3: Retrieve & Generate",
         "query": req.query,
         "standalone_query": standalone_query,
+        "retrieval_mode": mode_used,
         "session_id": client_sess_id,
         "scoped_session_id": scoped_sess_id,
         "history_turn_count": len(history),
@@ -1421,9 +1538,17 @@ def generate_guarded(
             )
 
     # 2. Retrieval using standalone query & trusted user_context
-    retrieved = indexer.search(
-        standalone_query,
+    retrieved, mode_used = execute_configured_retrieval(
+        indexer=indexer,
+        query=standalone_query,
         top_k=req.top_k or 3,
+        retrieval_mode=req.retrieval_mode,
+        alpha=req.alpha if req.alpha is not None else 0.5,
+        use_reranker=req.use_reranker if req.use_reranker is not None else False,
+        rrf_k=req.rrf_k if req.rrf_k is not None else 60,
+        weight_dense=req.weight_dense,
+        weight_bm25=req.weight_bm25,
+        candidate_multiplier=req.candidate_multiplier if req.candidate_multiplier is not None else 5,
         filters=req.filters,
         user_context=trusted_user_context
     )
@@ -1432,6 +1557,7 @@ def generate_guarded(
     passed, reason = guardrails.evaluate_retrieval(
         retrieved,
         query=standalone_query,
+        modality=mode_used if mode_used != "hybrid" else "rrf",
         threshold=req.threshold
     )
 
@@ -1452,6 +1578,7 @@ def generate_guarded(
             "phase": "Phase 4: Guardrails",
             "query": req.query,
             "standalone_query": standalone_query,
+            "retrieval_mode": mode_used,
             "session_id": client_sess_id,
             "scoped_session_id": scoped_sess_id,
             "history_turn_count": len(history),
@@ -1504,6 +1631,7 @@ def generate_guarded(
         "phase": "Phase 4: Guardrails",
         "query": req.query,
         "standalone_query": standalone_query,
+        "retrieval_mode": mode_used,
         "session_id": client_sess_id,
         "scoped_session_id": scoped_sess_id,
         "history_turn_count": len(history),

@@ -179,10 +179,10 @@ If neither Ollama nor a cloud key is present, TinyRAG automatically uses its zer
 | `/ingest-folder` | `POST` | Phase 2: Scan and ingest all files in a folder path |
 | `/index-status` | `GET` | Inspect all chunks currently in memory |
 | `/clear-index` | `POST` | Reset in-memory vector index |
-| `/retrieve` | `POST` | Phase 3: Retrieve top-k context chunks |
-| `/generate-rag` | `POST` | Phase 3: Retrieve and generate answer with provenance & session memory |
+| `/retrieve` | `POST` | Phase 3: Retrieve top-k context chunks (hybrid BM25+Dense+RRF, dense, bm25) |
+| `/generate-rag` | `POST` | Phase 3: Retrieve (hybrid/dense/bm25) and generate answer with provenance & session memory |
 | `/eval-recall` | `POST` | Phase 3: Compute Recall@K retrieval accuracy |
-| `/generate-guarded` | `POST` | Phase 4: Retrieve with confidence guardrails & groundedness checks |
+| `/generate-guarded` | `POST` | Phase 4: Retrieve (hybrid/dense/bm25) with confidence guardrails & groundedness checks |
 | `/sessions` | `GET` | Phase 5: List all active conversation sessions and turn counts |
 | `/sessions/{session_id}` | `GET` | Phase 5: Inspect full conversation dialogue history for a session |
 | `/sessions/{session_id}` | `DELETE` | Phase 5: Clear history buffer for a specific session |
