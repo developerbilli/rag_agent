@@ -103,7 +103,8 @@ from rag_core import (
     PrincipalRegistry,
     MetadataFilterEngine,
     BM25OkapiIndexer,
-    DocumentLockManager
+    DocumentLockManager,
+    DocumentSecurityError
 )
 
 app = FastAPI(
@@ -1026,48 +1027,39 @@ def ingest_documents(
     total_chunks_created = 0
 
     for doc in req.documents:
-        with DocumentLockManager.get_instance().process_lock(doc.doc_id):
-            # Authoritative existence and lifecycle check on internal document store
-            raw_existing_doc = indexer.get_raw_document(doc.doc_id)
-            if raw_existing_doc:
-                is_deleted = raw_existing_doc.get("status") == "deleted" or bool(raw_existing_doc.get("deleted"))
-                if is_deleted:
-                    if not principal.is_admin():
-                        dashboard.record_document_audit_event(
-                            principal_id=principal.principal_id,
-                            doc_id=doc.doc_id,
-                            operation="resurrection_rejected",
-                            result="FORBIDDEN",
-                            details={"reason": "Non-admin cannot resurrect deleted document via ingest"}
-                        )
-                        logger.warning(
-                            f"[Security Audit] Ingestion resurrection rejected: principal_id='{principal.principal_id}' "
-                            f"attempted to ingest/resurrect soft-deleted document '{doc.doc_id}'."
-                        )
-                        raise HTTPException(
-                            status_code=status.HTTP_403_FORBIDDEN,
-                            detail=f"Access denied: Document '{doc.doc_id}' has been deleted. "
-                                   f"Restoration requires administrator authorization."
-                        )
-                    op_type = "replace"
-                else:
-                    op_type = "replace"
-            else:
-                op_type = "create"
+        doc_meta = dict(doc.metadata or {})
+        doc_meta.setdefault("owner_id", principal.principal_id)
+        doc_meta.setdefault("created_by", principal.principal_id)
 
-            doc_meta = dict(doc.metadata or {})
-            doc_meta.setdefault("owner_id", principal.principal_id)
-            doc_meta.setdefault("created_by", principal.principal_id)
-
+        try:
             res = indexer.stage_and_commit_document(
                 doc_id=doc.doc_id,
                 text=doc.text,
                 title=doc.title,
                 chunker=request_chunker,
-                metadata=doc_meta
+                metadata=doc_meta,
+                user_context=principal
             )
             results.append(res)
             total_chunks_created += res.get("chunks_indexed", 0)
+            op_type = res.get("operation", "create")
+        except (DocumentSecurityError, PermissionError) as pe:
+            op = getattr(pe, "operation", "overwrite_rejected")
+            dashboard.record_document_audit_event(
+                principal_id=principal.principal_id,
+                doc_id=doc.doc_id,
+                operation=op,
+                result="FORBIDDEN",
+                details={"reason": str(pe)}
+            )
+            logger.warning(
+                f"[Security Audit] Ingestion rejected: principal_id='{principal.principal_id}' "
+                f"attempted unauthorized operation on document '{doc.doc_id}'. Result: 'FORBIDDEN'"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(pe)
+            )
 
         audit_result = "SUCCESS" if res.get("status") in ("committed", "skipped") else "FAILED"
         dashboard.record_document_audit_event(
@@ -1326,99 +1318,40 @@ async def upload_files(
                     continue
 
                 doc_id = doc["doc_id"]
+                doc_meta = dict(doc.get("metadata", {}))
+                doc_meta.setdefault("owner_id", principal.principal_id)
+                doc_meta.setdefault("created_by", principal.principal_id)
 
-                # Serialize existence check, ownership validation, and staged commit per doc_id to eliminate TOCTOU overwrite race conditions
-                with DocumentLockManager.get_instance().process_lock(doc_id):
-                    # Authoritative Existence & Lifecycle Check (directly on internal document store, without authorization filtering)
-                    raw_existing_doc = indexer.get_raw_document(doc_id)
-                    if raw_existing_doc:
-                        is_deleted = raw_existing_doc.get("status") == "deleted" or bool(raw_existing_doc.get("deleted"))
-                        existing_owner = raw_existing_doc.get("owner_id") or raw_existing_doc.get("metadata", {}).get("owner_id") or "system"
-
-                        # Rule 1: Existing deleted document -> reject ordinary user upload, resurrection is administrator-only
-                        if is_deleted:
-                            if not principal.is_admin():
-                                dashboard.record_document_audit_event(
-                                    principal_id=principal.principal_id,
-                                    doc_id=doc_id,
-                                    operation="resurrection_rejected",
-                                    result="FORBIDDEN",
-                                    details={
-                                        "existing_owner": existing_owner,
-                                        "filename": filename,
-                                        "reason": "Regular user cannot resurrect soft-deleted document"
-                                    }
-                                )
-                                logger.warning(
-                                    f"[Security Audit] Resurrection rejected: principal_id='{principal.principal_id}' "
-                                    f"attempted to upload/resurrect soft-deleted document '{doc_id}'. "
-                                    f"Operation: 'upload_resurrection', Result: 'FORBIDDEN'"
-                                )
-                                raise HTTPException(
-                                    status_code=status.HTTP_403_FORBIDDEN,
-                                    detail=f"Access denied: Document '{doc_id}' has been deleted. "
-                                           f"Restoration or replacement of deleted documents requires administrator authorization."
-                                )
-                            op_type = "replace"
-                        else:
-                            # Rule 2: Existing active document -> enforce ownership and replacement permission
-                            op_type = "replace"
-                            if not principal.is_admin() and existing_owner != principal.principal_id:
-                                dashboard.record_document_audit_event(
-                                    principal_id=principal.principal_id,
-                                    doc_id=doc_id,
-                                    operation="overwrite_rejected",
-                                    result="FORBIDDEN",
-                                    details={
-                                        "existing_owner": existing_owner,
-                                        "filename": filename,
-                                        "reason": "Caller does not own existing document"
-                                    }
-                                )
-                                logger.warning(
-                                    f"[Security Audit] Overwrite rejected: principal_id='{principal.principal_id}' "
-                                    f"attempted to overwrite document '{doc_id}' owned by '{existing_owner}'. "
-                                    f"Operation: 'upload_overwrite', Result: 'FORBIDDEN'"
-                                )
-                                raise HTTPException(
-                                    status_code=status.HTTP_403_FORBIDDEN,
-                                    detail=f"Access denied: Document '{doc_id}' already exists and is owned by '{existing_owner}'. "
-                                           f"You do not have permission to overwrite documents you do not own."
-                                )
-
-                            # Verify caller replacement privileges
-                            if not principal.is_admin():
-                                allow_own = os.environ.get("RAG_ALLOW_USER_DOCUMENT_REPLACEMENT", "true").lower() in ("true", "1", "yes")
-                                if not (allow_own or any(r in ("editor", "doc_editor", "data_admin") for r in principal.roles)):
-                                    dashboard.record_document_audit_event(
-                                        principal_id=principal.principal_id,
-                                        doc_id=doc_id,
-                                        operation="overwrite_rejected",
-                                        result="FORBIDDEN",
-                                        details={"reason": "User lacks document replacement permission"}
-                                    )
-                                    raise HTTPException(
-                                        status_code=status.HTTP_403_FORBIDDEN,
-                                        detail=f"Access denied: Principal '{principal.principal_id}' lacks document replacement permission."
-                                    )
-                    else:
-                        # Rule 3: Brand-new document -> assign ownership from authenticated principal
-                        op_type = "create"
-
-                    doc_meta = dict(doc.get("metadata", {}))
-                    doc_meta.setdefault("owner_id", principal.principal_id)
-                    doc_meta.setdefault("created_by", principal.principal_id)
-
-                    # Request-local chunker prevents concurrency race
-                    upload_chunker = TextChunker(chunk_size=200, overlap=40)
+                # Request-local chunker prevents concurrency race
+                upload_chunker = TextChunker(chunk_size=200, overlap=40)
+                try:
                     res = indexer.stage_and_commit_document(
-                        doc_id=doc["doc_id"],
+                        doc_id=doc_id,
                         text=raw_text,
                         title=doc["title"],
                         chunker=upload_chunker,
-                        metadata=doc_meta
+                        metadata=doc_meta,
+                        user_context=principal
                     )
                     results.append(res)
+                    op_type = res.get("operation", "create")
+                except (DocumentSecurityError, PermissionError) as pe:
+                    op = getattr(pe, "operation", "overwrite_rejected")
+                    dashboard.record_document_audit_event(
+                        principal_id=principal.principal_id,
+                        doc_id=doc_id,
+                        operation=op,
+                        result="FORBIDDEN",
+                        details={"filename": filename, "reason": str(pe)}
+                    )
+                    logger.warning(
+                        f"[Security Audit] {op}: principal_id='{principal.principal_id}' "
+                        f"attempted unauthorized operation on document '{doc_id}'. Result: 'FORBIDDEN'"
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=str(pe)
+                    )
             finally:
                 if tmp_path and os.path.exists(tmp_path):
                     try:
@@ -1742,11 +1675,13 @@ def delete_document_endpoint(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: Administrative privileges required to delete documents."
         )
-    with DocumentLockManager.get_instance().process_lock(doc_id):
-        res = indexer.delete_document(doc_id, hard_delete=hard_delete)
+    try:
+        res = indexer.delete_document(doc_id, hard_delete=hard_delete, user_context=principal)
         if res.get("status") == "not_found":
             raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found.")
         return res
+    except (DocumentSecurityError, PermissionError) as pe:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(pe))
 
 @protected_router.put("/documents/{doc_id}")
 def replace_document_endpoint(
@@ -1764,15 +1699,17 @@ def replace_document_endpoint(
             detail="Access denied: Administrative privileges required to replace documents."
         )
     try:
-        with DocumentLockManager.get_instance().process_lock(doc_id):
-            res = indexer.replace_document(
-                doc_id=doc_id,
-                text=req.text,
-                title=req.title or doc_id,
-                chunker=chunker,
-                metadata=req.metadata
-            )
-            return res
+        res = indexer.replace_document(
+            doc_id=doc_id,
+            text=req.text,
+            title=req.title or doc_id,
+            chunker=chunker,
+            metadata=req.metadata,
+            user_context=principal
+        )
+        return res
+    except (DocumentSecurityError, PermissionError) as pe:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(pe))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1791,9 +1728,10 @@ def restore_document_endpoint(
             detail="Access denied: Administrative privileges required to restore documents."
         )
     try:
-        with DocumentLockManager.get_instance().process_lock(doc_id):
-            res = indexer.restore_document(doc_id=doc_id, chunker=chunker)
-            return res
+        res = indexer.restore_document(doc_id=doc_id, chunker=chunker, user_context=principal)
+        return res
+    except (DocumentSecurityError, PermissionError) as pe:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(pe))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

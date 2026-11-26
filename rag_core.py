@@ -38,6 +38,19 @@ class IncompatibleEmbeddingModelError(Exception):
     """Raised when snapshot embedding dimension or model is incompatible with the active model."""
     pass
 
+
+class DocumentSecurityError(PermissionError):
+    """
+    Raised when document lifecycle, ownership, or replacement authorization fails
+    inside atomic indexer mutation operations. Subclasses PermissionError for
+    standard Python compatibility.
+    """
+    def __init__(self, detail: str, operation: str = "forbidden", doc_id: Optional[str] = None):
+        super().__init__(detail)
+        self.detail = detail
+        self.operation = operation
+        self.doc_id = doc_id
+
 # Try importing SentenceTransformer; if offline model download fails, use TF-IDF fallback
 try:
     from sentence_transformers import SentenceTransformer
@@ -2555,12 +2568,17 @@ class VectorIndexer:
         version_registry: Optional['DocumentVersionRegistry'] = None,
         metadata: Optional[Dict[str, Any]] = None,
         persist_snapshot: Optional[bool] = None,
-        snapshot_dir: Optional[str] = None
+        snapshot_dir: Optional[str] = None,
+        user_context: Optional[Union[Dict[str, Any], 'AuthenticatedPrincipal']] = None,
+        expected_owner: Optional[str] = None,
+        expected_version: Optional[int] = None,
+        enforce_ownership: bool = True
     ) -> Dict[str, Any]:
         """
         Canonical staged index construction & atomic publication ingestion pipeline.
         Acquires per-document mutex lock (DocumentLockManager.process_lock) to prevent
         concurrency races, TOCTOU interleaving, and duplicate ingestion.
+        Enforces lifecycle, ownership, and replacement authorization atomically with document commit.
         """
         with DocumentLockManager.get_instance().process_lock(doc_id):
             return self._stage_and_commit_document_impl(
@@ -2571,7 +2589,11 @@ class VectorIndexer:
                 version_registry=version_registry,
                 metadata=metadata,
                 persist_snapshot=persist_snapshot,
-                snapshot_dir=snapshot_dir
+                snapshot_dir=snapshot_dir,
+                user_context=user_context,
+                expected_owner=expected_owner,
+                expected_version=expected_version,
+                enforce_ownership=enforce_ownership
             )
 
     def _stage_and_commit_document_impl(
@@ -2583,16 +2605,117 @@ class VectorIndexer:
         version_registry: Optional['DocumentVersionRegistry'] = None,
         metadata: Optional[Dict[str, Any]] = None,
         persist_snapshot: Optional[bool] = None,
-        snapshot_dir: Optional[str] = None
+        snapshot_dir: Optional[str] = None,
+        user_context: Optional[Union[Dict[str, Any], 'AuthenticatedPrincipal']] = None,
+        expected_owner: Optional[str] = None,
+        expected_version: Optional[int] = None,
+        enforce_ownership: bool = True
     ) -> Dict[str, Any]:
         """
         Staged Index Construction & Atomic Publication Ingestion Pipeline:
+        0. Authorize: Under the per-document lock, inspect authoritative internal store and enforce
+           existence, lifecycle, ownership, and replacement privileges before any state mutation.
         1. Prepare: Check idempotency and chunk document.
         2. Stage: Build candidate replacement state in complete isolation.
         3. Validate: Verify cross-resource invariants on candidate state.
         4. Persist: If requested/configured, atomically replace snapshot on disk with generation record.
         5. Publish: Atomically swap in-memory pointers under write lock and invalidate cache.
         """
+        # Step 0: Authoritative Document Lifecycle, Ownership & Optimistic Concurrency Enforcement
+        raw_existing_doc = self.get_raw_document(doc_id)
+
+        # Resolve caller identity and administrative claims
+        caller_id = None
+        caller_roles = []
+        is_admin = False
+
+        if user_context is not None:
+            if hasattr(user_context, "principal_id"):
+                caller_id = user_context.principal_id
+                caller_roles = list(getattr(user_context, "roles", []))
+                is_admin = user_context.is_admin() if hasattr(user_context, "is_admin") else any(
+                    r in ("admin", "superuser", "data_admin", "sysadmin") for r in caller_roles
+                )
+            elif isinstance(user_context, dict):
+                caller_id = user_context.get("user_id") or user_context.get("principal_id") or user_context.get("sub")
+                caller_roles = list(user_context.get("roles") or [])
+                role = user_context.get("role")
+                if role and role not in caller_roles:
+                    caller_roles.append(role)
+                is_admin = bool(user_context.get("is_admin")) or any(
+                    r in ("admin", "superuser", "data_admin", "sysadmin") for r in caller_roles
+                )
+        elif metadata:
+            caller_id = metadata.get("owner_id") or metadata.get("created_by")
+            caller_roles = metadata.get("roles") or []
+            if caller_id == "system" or metadata.get("is_admin"):
+                is_admin = True
+
+        if caller_id is None:
+            caller_id = "system"
+            is_admin = True
+
+        # Check 1: Optimistic state/owner change guard
+        if expected_owner is not None:
+            current_owner = (raw_existing_doc.get("owner_id") or raw_existing_doc.get("metadata", {}).get("owner_id")) if raw_existing_doc else None
+            if current_owner != expected_owner:
+                raise DocumentSecurityError(
+                    f"Document state conflict: expected owner '{expected_owner}', but current owner is '{current_owner}'.",
+                    operation="state_conflict",
+                    doc_id=doc_id
+                )
+
+        if expected_version is not None:
+            current_ver = (raw_existing_doc.get("version") if raw_existing_doc else None)
+            if current_ver != expected_version:
+                raise DocumentSecurityError(
+                    f"Document version conflict: expected version {expected_version}, but current version is {current_ver}.",
+                    operation="version_conflict",
+                    doc_id=doc_id
+                )
+
+        # Check 2: Authoritative lifecycle and ownership validation
+        if enforce_ownership and (user_context is not None or caller_id != "system"):
+            if raw_existing_doc:
+                is_deleted = raw_existing_doc.get("status") == "deleted" or bool(raw_existing_doc.get("deleted"))
+                existing_owner = raw_existing_doc.get("owner_id") or raw_existing_doc.get("metadata", {}).get("owner_id") or "system"
+
+                if is_deleted:
+                    if not is_admin:
+                        raise DocumentSecurityError(
+                            f"Access denied: Document '{doc_id}' has been deleted. "
+                            f"Restoration or replacement of deleted documents requires administrator authorization.",
+                            operation="resurrection_rejected",
+                            doc_id=doc_id
+                        )
+                    op_type = "replace"
+                else:
+                    op_type = "replace"
+                    if not is_admin and existing_owner != caller_id:
+                        raise DocumentSecurityError(
+                            f"Access denied: Document '{doc_id}' already exists and is owned by '{existing_owner}'. "
+                            f"You do not have permission to overwrite documents you do not own.",
+                            operation="overwrite_rejected",
+                            doc_id=doc_id
+                        )
+
+                    if not is_admin:
+                        allow_own = os.environ.get("RAG_ALLOW_USER_DOCUMENT_REPLACEMENT", "true").lower() in ("true", "1", "yes")
+                        has_replace_role = any(r in ("editor", "doc_editor", "data_admin") for r in caller_roles)
+                        if not (allow_own or has_replace_role):
+                            raise DocumentSecurityError(
+                                f"Access denied: Principal '{caller_id}' lacks document replacement permission.",
+                                operation="overwrite_rejected",
+                                doc_id=doc_id
+                            )
+            else:
+                op_type = "create"
+        else:
+            op_type = "replace" if raw_existing_doc else "create"
+
+        owner_id = caller_id if (not raw_existing_doc or is_admin) else (raw_existing_doc.get("owner_id") or caller_id)
+        created_by = (raw_existing_doc.get("created_by") if raw_existing_doc else caller_id) or owner_id
+
         reg = version_registry or getattr(self, 'version_registry', None)
         
         # Step 1: Prepare
@@ -2605,6 +2728,8 @@ class VectorIndexer:
                 if len(doc_chunk_ids) == len(set(doc_chunk_ids)):
                     return {
                         "status": "skipped",
+                        "operation": op_type,
+                        "owner_id": owner_id,
                         "reason": "content_unchanged",
                         "doc_id": doc_id,
                         "version": version,
@@ -2619,10 +2744,16 @@ class VectorIndexer:
         if existing_doc_chunks:
             stale_chunk_ids = list(set(stale_chunk_ids) | set(existing_doc_chunks))
 
+        metadata = dict(metadata or {})
+        metadata["owner_id"] = owner_id
+        metadata["created_by"] = created_by
+
         new_chunks = chunker.chunk_document(doc_id, text, title, metadata=metadata)
         if not new_chunks:
             return {
                 "status": "skipped",
+                "operation": op_type,
+                "owner_id": owner_id,
                 "reason": "no_text_chunks",
                 "doc_id": doc_id,
                 "version": version,
@@ -2637,13 +2768,11 @@ class VectorIndexer:
         with lock:
             now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             existing_entry = getattr(self, 'source_documents', {}).get(doc_id, {})
-            owner_id = (metadata or {}).get("owner_id") or existing_entry.get("owner_id") or "system"
-            created_by = (metadata or {}).get("created_by") or existing_entry.get("created_by") or owner_id
             source_entry = {
                 "doc_id": doc_id,
                 "title": title,
                 "text": text,
-                "metadata": metadata or {},
+                "metadata": metadata,
                 "owner_id": owner_id,
                 "created_by": created_by,
                 "created_at": existing_entry.get("created_at", now_iso),
@@ -2692,6 +2821,8 @@ class VectorIndexer:
 
             return {
                 "status": "committed",
+                "operation": op_type,
+                "owner_id": owner_id,
                 "doc_id": doc_id,
                 "version": version,
                 "chunks_indexed": len(new_chunks),
@@ -2709,13 +2840,17 @@ class VectorIndexer:
         version_registry: Optional['DocumentVersionRegistry'] = None,
         metadata: Optional[Dict[str, Any]] = None,
         persist_snapshot: Optional[bool] = None,
-        snapshot_dir: Optional[str] = None
+        snapshot_dir: Optional[str] = None,
+        user_context: Optional[Union[Dict[str, Any], 'AuthenticatedPrincipal']] = None,
+        expected_owner: Optional[str] = None,
+        expected_version: Optional[int] = None,
+        enforce_ownership: bool = True
     ) -> Dict[str, Any]:
         """
         Canonical document lifecycle ingestion entrypoint.
         Routes through the 5-step transactional stage-and-commit lifecycle workflow.
         Guarantees idempotency, content deduplication, automatic eviction of stale revisions,
-        and ensures chunk ID uniqueness across the active index.
+        and atomic authorization enforcement.
         """
         return self.stage_and_commit_document(
             doc_id=doc_id,
@@ -2725,7 +2860,11 @@ class VectorIndexer:
             version_registry=version_registry,
             metadata=metadata,
             persist_snapshot=persist_snapshot,
-            snapshot_dir=snapshot_dir
+            snapshot_dir=snapshot_dir,
+            user_context=user_context,
+            expected_owner=expected_owner,
+            expected_version=expected_version,
+            enforce_ownership=enforce_ownership
         )
 
     # =========================================================================
@@ -2736,7 +2875,8 @@ class VectorIndexer:
         doc_id: str,
         hard_delete: bool = False,
         persist_snapshot: Optional[bool] = None,
-        snapshot_dir: Optional[str] = None
+        snapshot_dir: Optional[str] = None,
+        user_context: Optional[Union[Dict[str, Any], 'AuthenticatedPrincipal']] = None
     ) -> Dict[str, Any]:
         """
         Removes a document and all its chunks using staged index construction.
@@ -2748,7 +2888,8 @@ class VectorIndexer:
                 doc_id=doc_id,
                 hard_delete=hard_delete,
                 persist_snapshot=persist_snapshot,
-                snapshot_dir=snapshot_dir
+                snapshot_dir=snapshot_dir,
+                user_context=user_context
             )
 
     def _delete_document_impl(
@@ -2756,12 +2897,33 @@ class VectorIndexer:
         doc_id: str,
         hard_delete: bool = False,
         persist_snapshot: Optional[bool] = None,
-        snapshot_dir: Optional[str] = None
+        snapshot_dir: Optional[str] = None,
+        user_context: Optional[Union[Dict[str, Any], 'AuthenticatedPrincipal']] = None
     ) -> Dict[str, Any]:
         """
         Removes a document and all its chunks using staged index construction.
         Atomically updates Dense, BM25, Registry, Source Docs, and Cache without dirty reads.
         """
+        # Authorization check under lock if user_context is provided
+        if user_context is not None:
+            is_admin = False
+            caller_id = None
+            if hasattr(user_context, "is_admin"):
+                is_admin = user_context.is_admin()
+                caller_id = getattr(user_context, "principal_id", None)
+            elif isinstance(user_context, dict):
+                caller_roles = list(user_context.get("roles") or [])
+                is_admin = bool(user_context.get("is_admin")) or any(
+                    r in ("admin", "superuser", "data_admin", "sysadmin") for r in caller_roles
+                )
+                caller_id = user_context.get("user_id") or user_context.get("principal_id")
+            if not is_admin:
+                raise DocumentSecurityError(
+                    f"Access denied: Administrative privileges required to delete document '{doc_id}'.",
+                    operation="delete_rejected",
+                    doc_id=doc_id
+                )
+
         doc_chunks = [c for c in self.chunks if c.get("doc_id") == doc_id]
         has_source = hasattr(self, 'source_documents') and doc_id in self.source_documents
         has_reg = hasattr(self, 'version_registry') and doc_id in getattr(self.version_registry, 'registry', {})
@@ -2831,12 +2993,16 @@ class VectorIndexer:
         chunker: 'TextChunker',
         metadata: Optional[Dict[str, Any]] = None,
         persist_snapshot: Optional[bool] = None,
-        snapshot_dir: Optional[str] = None
+        snapshot_dir: Optional[str] = None,
+        user_context: Optional[Union[Dict[str, Any], 'AuthenticatedPrincipal']] = None,
+        expected_owner: Optional[str] = None,
+        expected_version: Optional[int] = None,
+        enforce_ownership: bool = True
     ) -> Dict[str, Any]:
         """
         Atomically replaces a document with new content using staged index construction.
         Builds, validates, optionally persists, and atomically publishes the replacement state.
-        Protected by per-document process lock.
+        Protected by per-document process lock and enforces lifecycle/ownership authorization.
         """
         with DocumentLockManager.get_instance().process_lock(doc_id):
             return self._replace_document_impl(
@@ -2846,7 +3012,11 @@ class VectorIndexer:
                 chunker=chunker,
                 metadata=metadata,
                 persist_snapshot=persist_snapshot,
-                snapshot_dir=snapshot_dir
+                snapshot_dir=snapshot_dir,
+                user_context=user_context,
+                expected_owner=expected_owner,
+                expected_version=expected_version,
+                enforce_ownership=enforce_ownership
             )
 
     def _replace_document_impl(
@@ -2857,12 +3027,102 @@ class VectorIndexer:
         chunker: 'TextChunker',
         metadata: Optional[Dict[str, Any]] = None,
         persist_snapshot: Optional[bool] = None,
-        snapshot_dir: Optional[str] = None
+        snapshot_dir: Optional[str] = None,
+        user_context: Optional[Union[Dict[str, Any], 'AuthenticatedPrincipal']] = None,
+        expected_owner: Optional[str] = None,
+        expected_version: Optional[int] = None,
+        enforce_ownership: bool = True
     ) -> Dict[str, Any]:
         """
         Atomically replaces a document with new content using staged index construction.
         Builds, validates, optionally persists, and atomically publishes the replacement state.
         """
+        raw_existing_doc = self.get_raw_document(doc_id)
+        if not raw_existing_doc:
+            raise KeyError(f"Document '{doc_id}' not found for replacement.")
+
+        # Resolve caller identity and administrative claims
+        caller_id = None
+        caller_roles = []
+        is_admin = False
+
+        if user_context is not None:
+            if hasattr(user_context, "principal_id"):
+                caller_id = user_context.principal_id
+                caller_roles = list(getattr(user_context, "roles", []))
+                is_admin = user_context.is_admin() if hasattr(user_context, "is_admin") else any(
+                    r in ("admin", "superuser", "data_admin", "sysadmin") for r in caller_roles
+                )
+            elif isinstance(user_context, dict):
+                caller_id = user_context.get("user_id") or user_context.get("principal_id") or user_context.get("sub")
+                caller_roles = list(user_context.get("roles") or [])
+                role = user_context.get("role")
+                if role and role not in caller_roles:
+                    caller_roles.append(role)
+                is_admin = bool(user_context.get("is_admin")) or any(
+                    r in ("admin", "superuser", "data_admin", "sysadmin") for r in caller_roles
+                )
+        elif metadata:
+            caller_id = metadata.get("owner_id") or metadata.get("created_by")
+            caller_roles = metadata.get("roles") or []
+            if caller_id == "system" or metadata.get("is_admin"):
+                is_admin = True
+
+        if caller_id is None:
+            caller_id = "system"
+            is_admin = True
+
+        # Check optimistic expectations
+        if expected_owner is not None:
+            current_owner = raw_existing_doc.get("owner_id") or raw_existing_doc.get("metadata", {}).get("owner_id")
+            if current_owner != expected_owner:
+                raise DocumentSecurityError(
+                    f"Document state conflict: expected owner '{expected_owner}', but current owner is '{current_owner}'.",
+                    operation="state_conflict",
+                    doc_id=doc_id
+                )
+
+        if expected_version is not None:
+            current_ver = raw_existing_doc.get("version")
+            if current_ver != expected_version:
+                raise DocumentSecurityError(
+                    f"Document version conflict: expected version {expected_version}, but current version is {current_ver}.",
+                    operation="version_conflict",
+                    doc_id=doc_id
+                )
+
+        # Enforce lifecycle and ownership privileges
+        if enforce_ownership and (user_context is not None or caller_id != "system"):
+            is_deleted = raw_existing_doc.get("status") == "deleted" or bool(raw_existing_doc.get("deleted"))
+            existing_owner = raw_existing_doc.get("owner_id") or raw_existing_doc.get("metadata", {}).get("owner_id") or "system"
+
+            if is_deleted:
+                if not is_admin:
+                    raise DocumentSecurityError(
+                        f"Access denied: Document '{doc_id}' has been deleted. "
+                        f"Restoration or replacement of deleted documents requires administrator authorization.",
+                        operation="resurrection_rejected",
+                        doc_id=doc_id
+                    )
+            else:
+                if not is_admin and existing_owner != caller_id:
+                    raise DocumentSecurityError(
+                        f"Access denied: Document '{doc_id}' already exists and is owned by '{existing_owner}'. "
+                        f"You do not have permission to overwrite documents you do not own.",
+                        operation="overwrite_rejected",
+                        doc_id=doc_id
+                    )
+
+                if not is_admin:
+                    allow_own = os.environ.get("RAG_ALLOW_USER_DOCUMENT_REPLACEMENT", "true").lower() in ("true", "1", "yes")
+                    has_replace_role = any(r in ("editor", "doc_editor", "data_admin") for r in caller_roles)
+                    if not (allow_own or has_replace_role):
+                        raise DocumentSecurityError(
+                            f"Access denied: Principal '{caller_id}' lacks document replacement permission.",
+                            operation="overwrite_rejected",
+                            doc_id=doc_id
+                        )
+
         new_chunks = chunker.chunk_document(doc_id, text, title, metadata=metadata)
         if not new_chunks:
             raise ValueError(f"Replacement text for '{doc_id}' produced 0 chunks.")
@@ -2940,16 +3200,42 @@ class VectorIndexer:
                 "tx_id": staged.tx_id
             }
 
-    def restore_document(self, doc_id: str, chunker: 'TextChunker') -> Dict[str, Any]:
+    def restore_document(
+        self,
+        doc_id: str,
+        chunker: 'TextChunker',
+        user_context: Optional[Union[Dict[str, Any], 'AuthenticatedPrincipal']] = None
+    ) -> Dict[str, Any]:
         """
         Restores a soft-deleted document from source document tracking,
         re-indexing its chunks into Dense and BM25 indices.
         Protected by per-document process lock.
         """
         with DocumentLockManager.get_instance().process_lock(doc_id):
-            return self._restore_document_impl(doc_id=doc_id, chunker=chunker)
+            return self._restore_document_impl(doc_id=doc_id, chunker=chunker, user_context=user_context)
 
-    def _restore_document_impl(self, doc_id: str, chunker: 'TextChunker') -> Dict[str, Any]:
+    def _restore_document_impl(
+        self,
+        doc_id: str,
+        chunker: 'TextChunker',
+        user_context: Optional[Union[Dict[str, Any], 'AuthenticatedPrincipal']] = None
+    ) -> Dict[str, Any]:
+        if user_context is not None:
+            is_admin = False
+            if hasattr(user_context, "is_admin"):
+                is_admin = user_context.is_admin()
+            elif isinstance(user_context, dict):
+                caller_roles = list(user_context.get("roles") or [])
+                is_admin = bool(user_context.get("is_admin")) or any(
+                    r in ("admin", "superuser", "data_admin", "sysadmin") for r in caller_roles
+                )
+            if not is_admin:
+                raise DocumentSecurityError(
+                    f"Access denied: Administrative privileges required to restore deleted document '{doc_id}'.",
+                    operation="resurrection_rejected",
+                    doc_id=doc_id
+                )
+
         source_doc = getattr(self, 'source_documents', {}).get(doc_id)
         if not source_doc or not source_doc.get("text"):
             raise ValueError(f"Cannot restore document '{doc_id}': No source document text found.")
@@ -2958,7 +3244,9 @@ class VectorIndexer:
         title = source_doc.get("title", doc_id)
         metadata = source_doc.get("metadata", {})
 
-        res = self.stage_and_commit_document(doc_id, text, title, chunker, metadata=metadata)
+        res = self.stage_and_commit_document(
+            doc_id, text, title, chunker, metadata=metadata, user_context=user_context
+        )
         if hasattr(self, 'source_documents') and doc_id in self.source_documents:
             self.source_documents[doc_id]["status"] = "active"
             self.source_documents[doc_id]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

@@ -29,7 +29,8 @@ from rag_core import (
     OperationalObservabilityDashboard,
     ModelUpgradeRollbackError,
     AuthenticatedPrincipal,
-    PrincipalRegistry
+    PrincipalRegistry,
+    DocumentSecurityError
 )
 
 class TestOfflineRAGPipeline(unittest.TestCase):
@@ -6515,6 +6516,89 @@ class TestIngestionRBACAndDocumentOwnership(unittest.TestCase):
         t.join()
 
         self.assertEqual(events, ["bg_started", "bg_done", "main_acquired"])
+
+    def test_indexer_stage_and_commit_atomic_ownership_enforcement(self):
+        """VectorIndexer.stage_and_commit_document enforces ownership, lifecycle, and optimistic locks atomically under mutex."""
+        doc_id = f"atomic_sec_doc_{int(self.time.time() * 1000)}"
+        chunker = TextChunker(chunk_size=100, overlap=20)
+
+        alice = AuthenticatedPrincipal(principal_id="alice_user", roles=["user"], clearance_level="public")
+        bob = AuthenticatedPrincipal(principal_id="bob_user", roles=["user"], clearance_level="public")
+        admin = AuthenticatedPrincipal(principal_id="admin_sec", roles=["admin"], clearance_level="top_secret")
+
+        # 1. Alice creates doc_id
+        res1 = self.indexer.stage_and_commit_document(
+            doc_id=doc_id,
+            text="Alice confidential notes on system architecture.",
+            title="Alice Doc",
+            chunker=chunker,
+            user_context=alice
+        )
+        self.assertEqual(res1.get("status"), "committed")
+        self.assertEqual(res1.get("operation"), "create")
+        self.assertEqual(res1.get("owner_id"), "alice_user")
+
+        # 2. Bob attempts to overwrite Alice's document -> DocumentSecurityError
+        with self.assertRaises(DocumentSecurityError) as ctx:
+            self.indexer.stage_and_commit_document(
+                doc_id=doc_id,
+                text="Bob malicious hijack of Alice document.",
+                title="Bob Overwrite",
+                chunker=chunker,
+                user_context=bob
+            )
+        self.assertEqual(ctx.exception.operation, "overwrite_rejected")
+        self.assertIn("You do not have permission to overwrite documents you do not own", str(ctx.exception))
+
+        # 3. Optimistic concurrency: expected_owner conflict
+        with self.assertRaises(DocumentSecurityError) as ctx:
+            self.indexer.stage_and_commit_document(
+                doc_id=doc_id,
+                text="Update with wrong expected owner.",
+                title="Alice Update",
+                chunker=chunker,
+                user_context=alice,
+                expected_owner="carol_user"
+            )
+        self.assertEqual(ctx.exception.operation, "state_conflict")
+
+        # 4. Optimistic concurrency: expected_version conflict
+        with self.assertRaises(DocumentSecurityError) as ctx:
+            self.indexer.stage_and_commit_document(
+                doc_id=doc_id,
+                text="Update with stale version.",
+                title="Alice Update",
+                chunker=chunker,
+                user_context=alice,
+                expected_version=99
+            )
+        self.assertEqual(ctx.exception.operation, "version_conflict")
+
+        # 5. Admin soft-deletes document
+        del_res = self.indexer.delete_document(doc_id, hard_delete=False, user_context=admin)
+        self.assertEqual(del_res.get("status"), "deleted")
+
+        # 6. Bob attempts to upload/resurrect soft-deleted document -> DocumentSecurityError
+        with self.assertRaises(DocumentSecurityError) as ctx:
+            self.indexer.stage_and_commit_document(
+                doc_id=doc_id,
+                text="Bob resurrecting deleted document.",
+                title="Bob Resurrection",
+                chunker=chunker,
+                user_context=bob
+            )
+        self.assertEqual(ctx.exception.operation, "resurrection_rejected")
+        self.assertIn("Restoration or replacement of deleted documents requires administrator authorization", str(ctx.exception))
+
+        # 7. Admin restores / overwrites document successfully
+        admin_res = self.indexer.stage_and_commit_document(
+            doc_id=doc_id,
+            text="Admin restored official document text.",
+            title="Admin Doc",
+            chunker=chunker,
+            user_context=admin
+        )
+        self.assertIn(admin_res.get("status"), ("committed", "restored"))
 
 
 class TestSessionIsolationInRoutingEndpoints(unittest.TestCase):
