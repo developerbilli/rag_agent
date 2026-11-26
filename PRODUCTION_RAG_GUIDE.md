@@ -385,6 +385,10 @@ In production environments, credentials transmitted via URL query strings or JSO
    - Global logging filter installed on `logger`, root logger, Uvicorn, and ASGI servers.
    - Automatically sanitizes Bearer tokens, `X-API-Key` values, authorization headers, and query parameters, replacing secrets with `[REDACTED]`.
    - Utility `redact_headers(dict)` strips sensitive header values prior to structured logging or debugging.
+5. **Absolute Precedence of Production Security Over Development Overrides**:
+   - `RAG_ALLOW_BUILTIN_TOKENS` and `RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT` are strictly development-only flags.
+   - When in production (`RAG_AUTH_MODE=production` or `RAG_API_KEY` configured), production security always wins: built-in tokens and insecure transport schemes are unconditionally rejected.
+   - Fail-fast startup: If either development-only override flag is enabled when `RAG_AUTH_MODE=production`, server startup immediately raises `RuntimeError` and refuses to boot.
 
 ---
 

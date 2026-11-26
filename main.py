@@ -216,15 +216,10 @@ def get_auth_mode() -> str:
 
 def has_auth_configuration() -> bool:
     """
-    Returns True if an authoritative authentication mechanism is configured
-    (RAG_API_KEY is non-empty or principal_registry contains non-builtin credentials).
+    Returns True if authoritative production authentication is configured
+    (RAG_API_KEY is set and non-empty).
     """
-    has_api_key = bool(os.environ.get("RAG_API_KEY", "").strip())
-    has_custom_tokens = any(
-        not principal_registry.is_builtin_token(t)
-        for t in principal_registry._token_to_principal.keys()
-    )
-    return has_api_key or has_custom_tokens
+    return bool(os.environ.get("RAG_API_KEY", "").strip())
 
 
 def is_production_auth_configured() -> bool:
@@ -236,10 +231,14 @@ def validate_auth_configuration() -> None:
     """
     Startup authentication validator.
     In production mode (RAG_AUTH_MODE=production or production environment):
-    Fails startup if no authentication configuration exists (e.g. RAG_API_KEY is absent).
+    1. Fails startup if no authentication configuration exists (e.g. RAG_API_KEY is absent).
+    2. Fails startup if development-only bypass flags are enabled:
+       - RAG_ALLOW_BUILTIN_TOKENS=true
+       - RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT=true
     """
     auth_mode = get_auth_mode()
     if auth_mode == "production":
+        # 1. Require authoritative authentication configuration
         if not has_auth_configuration():
             err_msg = (
                 "Production startup failed: RAG_AUTH_MODE is set to 'production' "
@@ -251,34 +250,59 @@ def validate_auth_configuration() -> None:
             logger.critical(f"[Security Startup Violation] {err_msg}")
             raise RuntimeError(err_msg)
 
+        # 2. Development overrides cannot weaken production security
+        if os.environ.get("RAG_ALLOW_BUILTIN_TOKENS", "").strip().lower() in ("true", "1", "yes"):
+            err_msg = (
+                "Production startup failed: RAG_ALLOW_BUILTIN_TOKENS is enabled while in production mode. "
+                "Built-in development tokens (admin-token, user-token) cannot be permitted in production environments."
+            )
+            logger.critical(f"[Security Startup Violation] {err_msg}")
+            raise RuntimeError(err_msg)
+
+        if os.environ.get("RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT", "").strip().lower() in ("true", "1", "yes"):
+            err_msg = (
+                "Production startup failed: RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT is enabled while in production mode. "
+                "Insecure credential transport (query parameters / JSON body) cannot be permitted in production environments."
+            )
+            logger.critical(f"[Security Startup Violation] {err_msg}")
+            raise RuntimeError(err_msg)
+
 
 def are_builtin_tokens_allowed() -> bool:
     """
     Built-in development tokens (admin-token, user-token, etc.) are strictly disabled
-    outside explicit test/development mode.
-    When production authentication is configured (RAG_API_KEY set or production environment),
-    built-in credentials are systematically rejected unless RAG_ALLOW_BUILTIN_TOKENS=true.
+    in production mode or whenever RAG_API_KEY is configured.
+    Production security always takes absolute precedence over development-only overrides.
     """
-    explicit_allow = os.environ.get("RAG_ALLOW_BUILTIN_TOKENS", "").strip().lower() in ("true", "1", "yes")
-    if explicit_allow:
-        return True
-    if is_production_auth_configured():
+    # Production always wins over development overrides
+    if get_auth_mode() == "production":
+        return False
+    if bool(os.environ.get("RAG_API_KEY", "").strip()):
+        return False
+
+    # In development mode without an API key:
+    val = os.environ.get("RAG_ALLOW_BUILTIN_TOKENS", "").strip().lower()
+    if val in ("false", "0", "no"):
         return False
     return True
 
 
 def is_strict_header_auth_enforced() -> bool:
     """
-    In production (when RAG_API_KEY is configured or RAG_ENV/ENVIRONMENT is production),
-    strict header-only authentication is enforced. Query parameter and body credentials
-    are strictly rejected to prevent credential leakage in access logs, browser history,
-    and monitoring traces.
-    Can be explicitly relaxed in non-production environments with RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT=true.
+    In production mode or when RAG_API_KEY is configured, strict header-only
+    authentication is ALWAYS enforced and cannot be weakened by development overrides.
+    Query parameter and body credentials are systematically rejected.
     """
+    # Production always wins over development overrides
+    if get_auth_mode() == "production":
+        return True
+    if bool(os.environ.get("RAG_API_KEY", "").strip()):
+        return True
+
+    # In development mode without an API key:
     if os.environ.get("RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT", "").strip().lower() in ("true", "1", "yes"):
         return False
-    return is_production_auth_configured() or \
-           os.environ.get("RAG_ENFORCE_HEADER_AUTH", "").strip().lower() in ("true", "1", "yes")
+    return os.environ.get("RAG_ENFORCE_HEADER_AUTH", "").strip().lower() in ("true", "1", "yes")
 
 
 async def get_current_principal(

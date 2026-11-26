@@ -4037,6 +4037,7 @@ class TestAPIAuthenticationAndRouteSeparation(unittest.TestCase):
             os.environ["RAG_API_KEY"] = self._orig_rag_api_key
         else:
             os.environ.pop("RAG_API_KEY", None)
+        os.environ.pop("RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT", None)
 
     def test_auth_01_open_developer_mode_when_rag_api_key_unset(self):
         """When RAG_API_KEY is unset or empty, protected routes operate in open developer mode."""
@@ -4121,17 +4122,20 @@ class TestAPIAuthenticationAndRouteSeparation(unittest.TestCase):
         self.assertEqual(res4.status_code, 400)
         self.assertIn("request body is prohibited", res4.json()["detail"])
 
-    def test_auth_04b_insecure_transport_opt_in_allows_query_body(self):
-        """When explicitly allowed via RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT=true, query and body are accepted."""
+    def test_auth_04b_insecure_transport_cannot_override_production_security(self):
+        """When RAG_API_KEY is configured, RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT cannot weaken transport."""
         test_key = "master-rag-access-key-42"
         os.environ["RAG_API_KEY"] = test_key
         os.environ["RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT"] = "true"
 
+        # Production security always wins: query and body are still rejected with 400
         res3 = self.client.get(f"/documents?api_key={test_key}")
-        self.assertEqual(res3.status_code, 200)
+        self.assertEqual(res3.status_code, 400)
+        self.assertIn("URL query parameters is prohibited", res3.json()["detail"])
 
         res4 = self.client.post("/retrieve", json={"query": "test", "top_k": 1, "api_key": test_key})
-        self.assertEqual(res4.status_code, 200)
+        self.assertEqual(res4.status_code, 400)
+        self.assertIn("request body is prohibited", res4.json()["detail"])
 
     def test_auth_05_public_health_and_ui_endpoints_remain_accessible_without_key(self):
         """Public system endpoints remain accessible without auth even when RAG_API_KEY is enforced."""
@@ -5357,13 +5361,15 @@ class TestBuiltInCredentialBypassPrevention(unittest.TestCase):
         res_user = self.client.get("/documents", headers={"Authorization": "Bearer user-token"})
         self.assertEqual(res_user.status_code, 200)
 
-    def test_builtin_06_explicit_test_mode_flag_allows_builtin_tokens(self):
-        """Setting RAG_ALLOW_BUILTIN_TOKENS=true allows built-in tokens even when RAG_API_KEY is set."""
+    def test_builtin_06_cannot_override_production_api_key_with_dev_flag(self):
+        """Setting RAG_ALLOW_BUILTIN_TOKENS=true CANNOT allow built-in tokens when RAG_API_KEY is set."""
         os.environ["RAG_API_KEY"] = "prod-key-active"
         os.environ["RAG_ALLOW_BUILTIN_TOKENS"] = "true"
 
+        # Production always wins: admin-token is rejected with 401 Unauthorized
         res = self.client.get("/documents", headers={"Authorization": "Bearer admin-token"})
-        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.status_code, 401)
+        self.assertIn("Built-in development credentials are disabled", res.json().get("detail", ""))
 
 
 class TestUploadDoSProtectionAndStreamingLimits(unittest.TestCase):
@@ -5621,14 +5627,16 @@ class TestHeaderAuthenticationAndLogRedaction(unittest.TestCase):
         self.assertEqual(res.status_code, 400)
         self.assertIn("URL query parameters is prohibited", res.json()["detail"])
 
-    def test_strict_auth_05_opt_in_allows_query_param_in_non_prod(self):
-        """RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT=true relaxes strict transport for dev/testing."""
+    def test_strict_auth_05_insecure_transport_flag_cannot_override_production_security(self):
+        """RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT=true CANNOT weaken strict transport when RAG_API_KEY is configured."""
         test_key = "production-header-key-777"
         os.environ["RAG_API_KEY"] = test_key
         os.environ["RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT"] = "true"
 
+        # Production always wins: query credentials are still rejected with 400
         res = self.client.get(f"/documents?api_key={test_key}")
-        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("URL query parameters is prohibited", res.json()["detail"])
 
     def test_log_redaction_01_bearer_token_masked_in_log_records(self):
         """SensitiveHeaderRedactionFilter replaces Bearer tokens with [REDACTED]."""
@@ -5955,7 +5963,10 @@ class TestAuthModeAndStartupValidation(unittest.TestCase):
             "RAG_ENV": os.environ.get("RAG_ENV"),
             "ENVIRONMENT": os.environ.get("ENVIRONMENT"),
             "RAG_ALLOW_BUILTIN_TOKENS": os.environ.get("RAG_ALLOW_BUILTIN_TOKENS"),
+            "RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT": os.environ.get("RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT"),
         }
+        os.environ.pop("RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT", None)
+        os.environ.pop("RAG_ALLOW_BUILTIN_TOKENS", None)
         from main import (
             app,
             get_auth_mode,
@@ -6089,6 +6100,68 @@ class TestAuthModeAndStartupValidation(unittest.TestCase):
         res = client.get("/health")
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.json().get("auth_mode"), "development")
+
+    def test_10_production_startup_fails_if_builtin_tokens_override_enabled(self):
+        """Startup fails with RuntimeError if RAG_ALLOW_BUILTIN_TOKENS=true in production mode."""
+        os.environ["RAG_AUTH_MODE"] = "production"
+        os.environ["RAG_API_KEY"] = "production-valid-secret-key-42"
+        os.environ["RAG_ALLOW_BUILTIN_TOKENS"] = "true"
+
+        with self.assertRaises(RuntimeError) as cm:
+            self.validate_auth_configuration()
+        self.assertIn("RAG_ALLOW_BUILTIN_TOKENS is enabled while in production mode", str(cm.exception))
+
+        from fastapi.testclient import TestClient
+        with self.assertRaises(RuntimeError) as cm_client:
+            with TestClient(self.app):
+                pass
+        self.assertIn("RAG_ALLOW_BUILTIN_TOKENS is enabled while in production mode", str(cm_client.exception))
+
+    def test_11_production_startup_fails_if_insecure_transport_override_enabled(self):
+        """Startup fails with RuntimeError if RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT=true in production mode."""
+        os.environ["RAG_AUTH_MODE"] = "production"
+        os.environ["RAG_API_KEY"] = "production-valid-secret-key-42"
+        os.environ.pop("RAG_ALLOW_BUILTIN_TOKENS", None)
+        os.environ["RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT"] = "true"
+
+        with self.assertRaises(RuntimeError) as cm:
+            self.validate_auth_configuration()
+        self.assertIn("RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT is enabled while in production mode", str(cm.exception))
+
+        from fastapi.testclient import TestClient
+        with self.assertRaises(RuntimeError) as cm_client:
+            with TestClient(self.app):
+                pass
+        self.assertIn("RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT is enabled while in production mode", str(cm_client.exception))
+
+    def test_12_neither_flag_weakens_production_authentication_at_runtime(self):
+        """Neither RAG_ALLOW_BUILTIN_TOKENS nor RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT weakens production runtime auth."""
+        os.environ["RAG_AUTH_MODE"] = "production"
+        os.environ["RAG_API_KEY"] = "prod-secret-key-12345"
+        os.environ["RAG_ALLOW_BUILTIN_TOKENS"] = "true"
+        os.environ["RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT"] = "true"
+
+        from fastapi.testclient import TestClient
+        client = TestClient(self.app)
+
+        # 1. Built-in admin token rejected with 401
+        res_admin = client.get("/documents", headers={"Authorization": "Bearer admin-token"})
+        self.assertEqual(res_admin.status_code, 401)
+        self.assertIn("Built-in development credentials are disabled", res_admin.json().get("detail", ""))
+
+        # 2. Query param credential rejected with 400
+        res_query = client.get("/documents?api_key=prod-secret-key-12345")
+        self.assertEqual(res_query.status_code, 400)
+        self.assertIn("URL query parameters is prohibited", res_query.json().get("detail", ""))
+
+        # 3. JSON body credential rejected with 400
+        res_body = client.post("/retrieve", json={"query": "test", "api_key": "prod-secret-key-12345"})
+        self.assertEqual(res_body.status_code, 400)
+        self.assertIn("request body is prohibited", res_body.json().get("detail", ""))
+
+        # 4. Valid header auth succeeds
+        res_valid = client.get("/documents", headers={"Authorization": "Bearer prod-secret-key-12345"})
+        self.assertEqual(res_valid.status_code, 200)
 
 
 class TestIngestionRBACAndDocumentOwnership(unittest.TestCase):

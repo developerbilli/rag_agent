@@ -218,6 +218,7 @@ The pipeline provides configurable authentication modes via `RAG_AUTH_MODE=devel
   - **Zero Open Access**: Unauthenticated requests are rejected with HTTP 401 Unauthorized.
   - **Built-in Token Blocking**: Development credentials (`admin-token`, `user-token`) are strictly blocked.
   - **Strict Header Transport**: Credentials must be supplied via headers (`Authorization: Bearer <token>` or `X-API-Key: <token>`). Credentials in query strings or JSON bodies are rejected with HTTP 400 Bad Request.
+  - **Production Precedence**: Development override flags (`RAG_ALLOW_BUILTIN_TOKENS=true`, `RAG_ALLOW_INSECURE_CREDENTIAL_TRANSPORT=true`) are prohibited in production mode; if configured, server startup fails immediately with `RuntimeError`.
 - **Development Mode (`RAG_AUTH_MODE=development`)**:
   - Local developers can explore APIs without configuring an API key, assigned a scoped non-privileged `dev_user` principal.
 - **Automated Log Redaction**:
