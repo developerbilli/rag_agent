@@ -297,36 +297,88 @@ class DocumentLoader:
             "source_path": file_path
         }
 
+    SUPPORTED_EXTENSIONS = {
+        '.txt', '.md', '.markdown', '.pdf', '.py', '.js', '.jsx', '.ts',
+        '.tsx', '.json', '.csv', '.tsv', '.html', '.css', '.xml', '.yaml', '.yml'
+    }
+
     @classmethod
-    def load_directory(cls, dir_path: str, recursive: bool = True) -> List[Dict[str, Any]]:
-        """Walks a directory and returns document dictionaries for all supported files."""
+    def load_directory(
+        cls,
+        dir_path: str,
+        recursive: bool = True,
+        allowed_root: Optional[str] = None,
+        max_files: Optional[int] = None,
+        max_total_size: Optional[int] = None,
+        reject_symlink_escapes: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Walks a directory and returns document dictionaries for all supported files.
+        Optionally enforces allowed_root boundaries, symlink escape checks,
+        and maximum file count / cumulative size limits.
+        """
         if not os.path.isdir(dir_path):
             raise NotADirectoryError(f"Directory not found: {dir_path}")
 
-        supported_exts = {
-            '.txt', '.md', '.markdown', '.pdf', '.py', '.js', '.jsx', '.ts',
-            '.tsx', '.json', '.csv', '.tsv', '.html', '.css', '.xml', '.yaml', '.yml'
-        }
+        real_root = None
+        if allowed_root:
+            real_root = os.path.realpath(os.path.abspath(allowed_root))
+            real_dir = os.path.realpath(os.path.abspath(dir_path))
+            try:
+                if os.path.commonpath([real_dir, real_root]) != real_root:
+                    raise PermissionError(f"Directory '{dir_path}' resolves outside allowed root '{allowed_root}'.")
+            except ValueError:
+                raise PermissionError(f"Directory '{dir_path}' resolves outside allowed root '{allowed_root}'.")
+
         documents = []
+        candidate_paths = []
 
         if recursive:
-            for root, _, files in os.walk(dir_path):
+            for root, dirs, files in os.walk(dir_path, followlinks=False):
+                if real_root and reject_symlink_escapes:
+                    for d in dirs:
+                        dir_full = os.path.join(root, d)
+                        if os.path.islink(dir_full):
+                            target = os.path.realpath(dir_full)
+                            try:
+                                if os.path.commonpath([target, real_root]) != real_root:
+                                    raise ValueError(f"Symlink escape detected: directory '{d}' links outside allowed root.")
+                            except ValueError:
+                                raise ValueError(f"Symlink escape detected: directory '{d}' links outside allowed root.")
                 for f in files:
-                    if os.path.splitext(f)[1].lower() in supported_exts:
-                        full_path = os.path.join(root, f)
-                        try:
-                            documents.append(cls.load_file(full_path))
-                        except Exception as e:
-                            print(f"[DocumentLoader] Skipped '{full_path}' due to error: {e}")
+                    if os.path.splitext(f)[1].lower() in cls.SUPPORTED_EXTENSIONS:
+                        candidate_paths.append(os.path.join(root, f))
         else:
             for f in os.listdir(dir_path):
-                if os.path.splitext(f)[1].lower() in supported_exts:
+                if os.path.splitext(f)[1].lower() in cls.SUPPORTED_EXTENSIONS:
                     full_path = os.path.join(dir_path, f)
                     if os.path.isfile(full_path):
-                        try:
-                            documents.append(cls.load_file(full_path))
-                        except Exception as e:
-                            print(f"[DocumentLoader] Skipped '{full_path}' due to error: {e}")
+                        candidate_paths.append(full_path)
+
+        if max_files is not None and len(candidate_paths) > max_files:
+            raise ValueError(f"Folder ingestion limit exceeded: found {len(candidate_paths)} files (maximum allowed: {max_files}).")
+
+        total_size = 0
+        for full_path in candidate_paths:
+            if real_root and reject_symlink_escapes and os.path.islink(full_path):
+                target = os.path.realpath(full_path)
+                try:
+                    if os.path.commonpath([target, real_root]) != real_root:
+                        raise ValueError(f"Symlink escape detected: file '{os.path.basename(full_path)}' links outside allowed root.")
+                except ValueError:
+                    raise ValueError(f"Symlink escape detected: file '{os.path.basename(full_path)}' links outside allowed root.")
+
+            try:
+                file_sz = os.path.getsize(full_path)
+                total_size += file_sz
+                if max_total_size is not None and total_size > max_total_size:
+                    raise ValueError(f"Folder ingestion limit exceeded: total size ({total_size} bytes) exceeds limit ({max_total_size} bytes).")
+            except OSError:
+                pass
+
+            try:
+                documents.append(cls.load_file(full_path))
+            except Exception as e:
+                print(f"[DocumentLoader] Skipped '{full_path}' due to error: {e}")
 
         return documents
 

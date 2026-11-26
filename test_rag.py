@@ -4580,5 +4580,221 @@ class TestSensitiveEndpointsAndSessionIsolationProtection(unittest.TestCase):
         self.assertIn("Cannot access conversation session belonging to another user", res_hack.json().get("detail", ""))
 
 
+class TestFolderIngestionSecurityAndPathValidation(unittest.TestCase):
+    """
+    Security test suite verifying:
+    1. Hosted deployment disablement (RAG_ENABLE_FOLDER_INGESTION=false) returns 403.
+    2. Administrative authorization requirement (non-admin receives 403, unauthenticated receives 401).
+    3. Path traversal rejection outside configured allowlisted root.
+    4. Rejection of symlink escapes (symlinked files resolving outside root).
+    5. Rejection of symlink escapes (symlinked directories resolving outside root).
+    6. Enforcement of maximum file count limits.
+    7. Enforcement of cumulative file size limits.
+    8. Ingestion within allowlisted root succeeds for authorized admin.
+    9. Non-existent folder within allowlisted root returns 404.
+    """
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        from main import app
+        self.client = TestClient(app)
+        self.admin_headers = {"Authorization": "Bearer admin-token"}
+        self.user_headers = {"Authorization": "Bearer user-token"}
+        self.analyst_headers = {"Authorization": "Bearer analyst-token"}
+
+        self._orig_env = {
+            "RAG_API_KEY": os.environ.get("RAG_API_KEY"),
+            "RAG_ENABLE_FOLDER_INGESTION": os.environ.get("RAG_ENABLE_FOLDER_INGESTION"),
+            "RAG_INGESTION_ROOT_DIR": os.environ.get("RAG_INGESTION_ROOT_DIR"),
+            "RAG_MAX_FOLDER_FILES": os.environ.get("RAG_MAX_FOLDER_FILES"),
+            "RAG_MAX_FOLDER_SIZE_BYTES": os.environ.get("RAG_MAX_FOLDER_SIZE_BYTES"),
+        }
+        self.temp_dir = tempfile.mkdtemp(prefix="rag_secure_ingest_test_")
+
+    def tearDown(self):
+        for k, v in self._orig_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_folder_01_disabled_in_hosted_environment(self):
+        os.environ["RAG_ENABLE_FOLDER_INGESTION"] = "false"
+        res = self.client.post(
+            "/ingest-folder",
+            json={"folder_path": self.temp_dir},
+            headers=self.admin_headers
+        )
+        self.assertEqual(res.status_code, 403)
+        self.assertIn("Folder ingestion is disabled in hosted environments", res.json().get("detail", ""))
+
+    def test_folder_02_requires_admin_authorization(self):
+        os.environ["RAG_ENABLE_FOLDER_INGESTION"] = "true"
+        os.environ["RAG_INGESTION_ROOT_DIR"] = self.temp_dir
+        os.environ["RAG_API_KEY"] = "configured-rag-key-secret"
+
+        # Unauthenticated caller is rejected with 401 Unauthorized when API key is enforced
+        res_unauth = self.client.post("/ingest-folder", json={"folder_path": self.temp_dir})
+        self.assertEqual(res_unauth.status_code, 401)
+
+        # Standard user caller (valid auth, but non-admin) is rejected with 403 Forbidden
+        res_user = self.client.post(
+            "/ingest-folder",
+            json={"folder_path": self.temp_dir},
+            headers=self.user_headers
+        )
+        self.assertEqual(res_user.status_code, 403)
+        self.assertIn("Administrator authorization required", res_user.json().get("detail", ""))
+
+        # Analyst user caller (valid auth, but non-admin) is also rejected with 403 Forbidden
+        res_analyst = self.client.post(
+            "/ingest-folder",
+            json={"folder_path": self.temp_dir},
+            headers=self.analyst_headers
+        )
+        self.assertEqual(res_analyst.status_code, 403)
+        self.assertIn("Administrator authorization required", res_analyst.json().get("detail", ""))
+        self.assertIn("Administrator authorization required", res_user.json().get("detail", ""))
+
+    def test_folder_03_rejects_path_traversal_outside_allowlisted_root(self):
+        os.environ["RAG_ENABLE_FOLDER_INGESTION"] = "true"
+        os.environ["RAG_INGESTION_ROOT_DIR"] = self.temp_dir
+
+        # Relative traversal
+        res_trav = self.client.post(
+            "/ingest-folder",
+            json={"folder_path": "../../etc"},
+            headers=self.admin_headers
+        )
+        self.assertEqual(res_trav.status_code, 403)
+        self.assertIn("outside allowlisted ingestion root", res_trav.json().get("detail", ""))
+
+        # Absolute arbitrary path
+        res_abs = self.client.post(
+            "/ingest-folder",
+            json={"folder_path": "/etc"},
+            headers=self.admin_headers
+        )
+        self.assertEqual(res_abs.status_code, 403)
+        self.assertIn("outside allowlisted ingestion root", res_abs.json().get("detail", ""))
+
+    def test_folder_04_rejects_symlink_escape_file(self):
+        os.environ["RAG_ENABLE_FOLDER_INGESTION"] = "true"
+        os.environ["RAG_INGESTION_ROOT_DIR"] = self.temp_dir
+
+        # Create external file outside temp_dir
+        ext_dir = tempfile.mkdtemp(prefix="rag_external_")
+        ext_file = os.path.join(ext_dir, "secret.txt")
+        with open(ext_file, "w") as f:
+            f.write("confidential root data")
+
+        try:
+            # Create symlink inside allowlisted temp_dir pointing to external file
+            symlink_file = os.path.join(self.temp_dir, "leak_link.txt")
+            os.symlink(ext_file, symlink_file)
+
+            res = self.client.post(
+                "/ingest-folder",
+                json={"folder_path": self.temp_dir},
+                headers=self.admin_headers
+            )
+            self.assertEqual(res.status_code, 400)
+            self.assertIn("Symlink escape detected", res.json().get("detail", ""))
+        finally:
+            shutil.rmtree(ext_dir, ignore_errors=True)
+
+    def test_folder_05_rejects_symlink_escape_directory(self):
+        os.environ["RAG_ENABLE_FOLDER_INGESTION"] = "true"
+        os.environ["RAG_INGESTION_ROOT_DIR"] = self.temp_dir
+
+        ext_dir = tempfile.mkdtemp(prefix="rag_external_dir_")
+        with open(os.path.join(ext_dir, "external_note.md"), "w") as f:
+            f.write("# External Note")
+
+        try:
+            symlink_dir = os.path.join(self.temp_dir, "escape_folder")
+            os.symlink(ext_dir, symlink_dir)
+
+            res = self.client.post(
+                "/ingest-folder",
+                json={"folder_path": self.temp_dir, "recursive": True},
+                headers=self.admin_headers
+            )
+            self.assertEqual(res.status_code, 400)
+            self.assertIn("Symlink escape detected", res.json().get("detail", ""))
+        finally:
+            shutil.rmtree(ext_dir, ignore_errors=True)
+
+    def test_folder_06_enforces_file_count_limit(self):
+        os.environ["RAG_ENABLE_FOLDER_INGESTION"] = "true"
+        os.environ["RAG_INGESTION_ROOT_DIR"] = self.temp_dir
+        os.environ["RAG_MAX_FOLDER_FILES"] = "2"
+
+        # Create 4 files
+        for i in range(4):
+            with open(os.path.join(self.temp_dir, f"doc_{i}.txt"), "w") as f:
+                f.write(f"Sample content for document {i} to exceed limit.")
+
+        res = self.client.post(
+            "/ingest-folder",
+            json={"folder_path": self.temp_dir},
+            headers=self.admin_headers
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("limit exceeded", res.json().get("detail", "").lower())
+        self.assertIn("maximum allowed: 2", res.json().get("detail", ""))
+
+    def test_folder_07_enforces_cumulative_size_limit(self):
+        os.environ["RAG_ENABLE_FOLDER_INGESTION"] = "true"
+        os.environ["RAG_INGESTION_ROOT_DIR"] = self.temp_dir
+        os.environ["RAG_MAX_FOLDER_SIZE_BYTES"] = "200"
+
+        with open(os.path.join(self.temp_dir, "large.txt"), "w") as f:
+            f.write("A" * 500)
+
+        res = self.client.post(
+            "/ingest-folder",
+            json={"folder_path": self.temp_dir},
+            headers=self.admin_headers
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("limit exceeded", res.json().get("detail", "").lower())
+        self.assertIn("total size", res.json().get("detail", "").lower())
+
+    def test_folder_08_valid_folder_ingestion_succeeds(self):
+        os.environ["RAG_ENABLE_FOLDER_INGESTION"] = "true"
+        os.environ["RAG_INGESTION_ROOT_DIR"] = self.temp_dir
+
+        with open(os.path.join(self.temp_dir, "valid_1.md"), "w") as f:
+            f.write("# System Architecture\nThis document describes distributed cluster consensus protocols.")
+        with open(os.path.join(self.temp_dir, "valid_2.txt"), "w") as f:
+            f.write("Fault-tolerant storage design with replicated state machines and leader election.")
+
+        res = self.client.post(
+            "/ingest-folder",
+            json={"folder_path": self.temp_dir},
+            headers=self.admin_headers
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["documents_processed"], 2)
+        self.assertGreater(data["chunks_created"], 0)
+
+    def test_folder_09_nonexistent_directory_returns_404(self):
+        os.environ["RAG_ENABLE_FOLDER_INGESTION"] = "true"
+        os.environ["RAG_INGESTION_ROOT_DIR"] = self.temp_dir
+
+        non_existent = os.path.join(self.temp_dir, "does_not_exist_subfolder")
+        res = self.client.post(
+            "/ingest-folder",
+            json={"folder_path": non_existent},
+            headers=self.admin_headers
+        )
+        self.assertEqual(res.status_code, 404)
+        self.assertIn("does not exist", res.json().get("detail", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -437,14 +437,105 @@ async def upload_files(files: List[UploadFile] = File(...)):
 
 
 @protected_router.post("/ingest-folder")
-def ingest_folder(req: IngestFolderRequest):
+def ingest_folder(
+    req: IngestFolderRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal)
+):
     """
-    Phase 2: Scans a local folder on disk for .pdf, .txt, and .md files and indexes them.
+    Phase 2: Scans a local folder on disk within the allowlisted ingestion root for supported files.
+    Protected against arbitrary server path traversal, symlink escapes, DoS file/size exhaustion,
+    and can be completely disabled in hosted environments via RAG_ENABLE_FOLDER_INGESTION=false.
+    Strictly restricted to administrators.
     """
-    if not os.path.isdir(req.folder_path):
-        raise HTTPException(status_code=404, detail=f"Directory '{req.folder_path}' does not exist.")
+    # 1. Disable in hosted deployments if configured
+    if os.environ.get("RAG_ENABLE_FOLDER_INGESTION", "true").lower() in ("false", "0", "no", "disabled", "off"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Folder ingestion is disabled in hosted environments."
+        )
 
-    docs = DocumentLoader.load_directory(req.folder_path, recursive=req.recursive)
+    # 2. Administrative authorization required
+    if not principal.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Administrator authorization required for folder ingestion."
+        )
+
+    if not req.folder_path or not req.folder_path.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Folder path cannot be empty.")
+
+    # 3. Resolve and validate allowlisted root directory
+    config_root = os.environ.get("RAG_INGESTION_ROOT_DIR")
+    if config_root:
+        allowed_root = os.path.realpath(os.path.abspath(config_root))
+    else:
+        # Default allowlisted root is the project's sample_data directory
+        default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_data")
+        allowed_root = os.path.realpath(os.path.abspath(default_dir))
+
+    raw_path = req.folder_path.strip()
+    if os.path.isabs(raw_path):
+        candidate_path = os.path.realpath(os.path.abspath(raw_path))
+    else:
+        cwd_candidate = os.path.realpath(os.path.abspath(raw_path))
+        root_candidate = os.path.realpath(os.path.abspath(os.path.join(allowed_root, raw_path)))
+        try:
+            if os.path.commonpath([cwd_candidate, allowed_root]) == allowed_root:
+                candidate_path = cwd_candidate
+            else:
+                candidate_path = root_candidate
+        except ValueError:
+            candidate_path = root_candidate
+
+    # Verify candidate_path is strictly inside or equal to allowed_root
+    try:
+        if os.path.commonpath([candidate_path, allowed_root]) != allowed_root:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Access denied: Path '{req.folder_path}' resolves outside allowlisted ingestion root."
+            )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Access denied: Path '{req.folder_path}' resolves outside allowlisted ingestion root."
+        )
+
+    # Verify directory exists
+    if not os.path.exists(candidate_path) or not os.path.isdir(candidate_path):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Directory '{req.folder_path}' does not exist.")
+
+    # 4. Limits for files and cumulative size
+    try:
+        max_files = int(os.environ.get("RAG_MAX_FOLDER_FILES", "100"))
+    except ValueError:
+        max_files = 100
+
+    try:
+        max_total_size = int(os.environ.get("RAG_MAX_FOLDER_SIZE_BYTES", str(50 * 1024 * 1024)))
+    except ValueError:
+        max_total_size = 50 * 1024 * 1024
+
+    # 5. Load documents with root confinement, symlink escape rejection, and resource caps
+    try:
+        docs = DocumentLoader.load_directory(
+            candidate_path,
+            recursive=req.recursive,
+            allowed_root=allowed_root,
+            max_files=max_files,
+            max_total_size=max_total_size,
+            reject_symlink_escapes=True
+        )
+    except PermissionError as pe:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(pe))
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to load folder documents: {e}")
+
+    # 6. Chunking
+    chunker.chunk_size = req.chunk_size or 150
+    chunker.overlap = req.overlap or 30
+
     new_chunks = []
     for doc in docs:
         c = chunker.chunk_document(doc["doc_id"], doc["text"], doc["title"])
@@ -456,6 +547,7 @@ def ingest_folder(req: IngestFolderRequest):
     return {
         "status": "success",
         "folder_path": req.folder_path,
+        "resolved_path": candidate_path,
         "documents_processed": len(docs),
         "chunks_created": len(new_chunks),
         "total_index_size": len(indexer.chunks)
