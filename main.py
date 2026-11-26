@@ -263,23 +263,35 @@ class FactualComputeRequest(BaseModel):
 
 @app.on_event("startup")
 def auto_ingest_sample_corpus():
-    """Seed index on startup with sample corpus and sample_data files if present."""
-    all_chunks = []
+    """Seed index on startup through canonical lifecycle API."""
     for doc in SAMPLE_DOCUMENTS:
-        c = chunker.chunk_document(doc["doc_id"], doc["text"], doc["title"])
-        all_chunks.extend(c)
+        try:
+            indexer.stage_and_commit_document(
+                doc_id=doc["doc_id"],
+                text=doc["text"],
+                title=doc["title"],
+                chunker=chunker,
+                metadata=doc.get("metadata", {})
+            )
+        except Exception as e:
+            print(f"[Startup] Error seeding {doc.get('doc_id')}: {e}")
     
     # Also load sample_data directory if it exists
     if os.path.isdir("sample_data"):
         try:
             extra_docs = DocumentLoader.load_directory("sample_data", recursive=False)
             for doc in extra_docs:
-                c = chunker.chunk_document(doc["doc_id"], doc["text"], doc["title"])
-                all_chunks.extend(c)
+                raw_text = doc.get("text", "").strip()
+                if raw_text:
+                    indexer.stage_and_commit_document(
+                        doc_id=doc["doc_id"],
+                        text=raw_text,
+                        title=doc.get("title", doc["doc_id"]),
+                        chunker=chunker,
+                        metadata=doc.get("metadata", {})
+                    )
         except Exception as e:
             print(f"[Startup] Error auto-loading sample_data: {e}")
-
-    indexer.add_chunks(all_chunks)
 
 
 # ==========================================
@@ -363,36 +375,49 @@ def generate_naive(req: QueryRequest):
 def ingest_documents(req: IngestRequest):
     """
     Phase 2: Ingests documents, chunks them, embeds vectors, and indexes them in memory.
+    Routes every document through canonical lifecycle management (stage_and_commit_document).
+    Guarantees revision tracking, atomic publication, and chunk ID uniqueness.
     """
     chunker.chunk_size = req.chunk_size or 150
     chunker.overlap = req.overlap or 30
 
-    created_chunks = []
-    for doc in req.documents:
-        chunks = chunker.chunk_document(doc.doc_id, doc.text, doc.title, metadata=doc.metadata)
-        created_chunks.extend(chunks)
+    results = []
+    total_chunks_created = 0
 
-    indexer.add_chunks(created_chunks)
+    for doc in req.documents:
+        res = indexer.stage_and_commit_document(
+            doc_id=doc.doc_id,
+            text=doc.text,
+            title=doc.title,
+            chunker=chunker,
+            metadata=doc.metadata
+        )
+        results.append(res)
+        total_chunks_created += res.get("chunks_indexed", 0)
 
     return {
         "phase": "Phase 2: Ingest Pipeline",
         "documents_processed": len(req.documents),
-        "total_chunks_created": len(created_chunks),
-        "total_index_size": len(indexer.chunks)
+        "total_chunks_created": total_chunks_created,
+        "total_index_size": len(indexer.chunks),
+        "results": results
     }
 
 
 @protected_router.post("/upload")
 async def upload_files(files: List[UploadFile] = File(...)):
     """
-    Phase 2: Uploads one or more files (.pdf, .txt, .md, and code formats), chunks them, and adds to index.
+    Phase 2: Uploads one or more files (.pdf, .txt, .md, and code formats).
+    Routes every document through canonical lifecycle management (stage_and_commit_document).
+    Guarantees revision tracking, idempotent re-upload handling, and chunk ID uniqueness.
     """
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
 
     processed_count = 0
-    new_chunks = []
+    total_chunks_created = 0
     errors = []
+    results = []
 
     for file in files:
         filename = os.path.basename(file.filename or "uploaded_file")
@@ -408,30 +433,36 @@ async def upload_files(files: List[UploadFile] = File(...)):
                 errors.append(f"'{filename}': File is empty or contains unreadable/scanned content")
                 continue
 
-            chunks = chunker.chunk_document(doc["doc_id"], raw_text, doc["title"])
-            if not chunks:
+            res = indexer.stage_and_commit_document(
+                doc_id=doc["doc_id"],
+                text=raw_text,
+                title=doc["title"],
+                chunker=chunker,
+                metadata=doc.get("metadata", {})
+            )
+            results.append(res)
+
+            if res.get("status") == "skipped" and res.get("reason") == "no_text_chunks":
                 errors.append(f"'{filename}': Produced 0 chunks (insufficient text)")
                 continue
 
-            new_chunks.extend(chunks)
+            total_chunks_created += res.get("chunks_indexed", 0)
             processed_count += 1
         except Exception as e:
             err_msg = f"'{filename}': {str(e)}"
             errors.append(err_msg)
             print(f"[Upload Error] {err_msg}", flush=True)
 
-    if new_chunks:
-        indexer.add_chunks(new_chunks)
-
-    if processed_count == 0 or len(new_chunks) == 0:
+    if processed_count == 0:
         detail_msg = "; ".join(errors) if errors else "No readable text chunks could be extracted from uploaded files."
         raise HTTPException(status_code=400, detail=detail_msg)
 
     return {
         "status": "success",
         "files_processed": processed_count,
-        "chunks_created": len(new_chunks),
+        "chunks_created": total_chunks_created,
         "total_index_size": len(indexer.chunks),
+        "results": results,
         "warnings": errors if errors else None
     }
 
@@ -532,25 +563,34 @@ def ingest_folder(
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to load folder documents: {e}")
 
-    # 6. Chunking
+    # 6. Canonical Document Lifecycle Ingestion
     chunker.chunk_size = req.chunk_size or 150
     chunker.overlap = req.overlap or 30
 
-    new_chunks = []
+    total_chunks_created = 0
+    results = []
     for doc in docs:
-        c = chunker.chunk_document(doc["doc_id"], doc["text"], doc["title"])
-        new_chunks.extend(c)
-
-    if new_chunks:
-        indexer.add_chunks(new_chunks)
+        raw_text = doc.get("text", "").strip()
+        if not raw_text:
+            continue
+        res = indexer.stage_and_commit_document(
+            doc_id=doc["doc_id"],
+            text=raw_text,
+            title=doc.get("title", doc["doc_id"]),
+            chunker=chunker,
+            metadata=doc.get("metadata", {})
+        )
+        results.append(res)
+        total_chunks_created += res.get("chunks_indexed", 0)
 
     return {
         "status": "success",
         "folder_path": req.folder_path,
         "resolved_path": candidate_path,
         "documents_processed": len(docs),
-        "chunks_created": len(new_chunks),
-        "total_index_size": len(indexer.chunks)
+        "chunks_created": total_chunks_created,
+        "total_index_size": len(indexer.chunks),
+        "results": results
     }
 
 

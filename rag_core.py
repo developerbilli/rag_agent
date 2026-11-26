@@ -2453,11 +2453,34 @@ class VectorIndexer:
         if reg:
             needs_update, version, content_hash, stale_chunk_ids = reg.check_document(doc_id, text)
             if not needs_update:
-                return {"status": "skipped", "reason": "content_unchanged", "doc_id": doc_id, "version": version}
+                # Verify active index actually has unique chunk IDs for this document
+                doc_chunk_ids = [c["chunk_id"] for c in self.chunks if c.get("doc_id") == doc_id]
+                if len(doc_chunk_ids) == len(set(doc_chunk_ids)):
+                    return {
+                        "status": "skipped",
+                        "reason": "content_unchanged",
+                        "doc_id": doc_id,
+                        "version": version,
+                        "chunks_indexed": 0,
+                        "total_index_size": len(self.chunks),
+                        "index_generation": getattr(self, "index_generation", 1)
+                    }
+                needs_update = True
+
+        # Ensure all existing chunks for doc_id in active index are marked for eviction
+        existing_doc_chunks = [c["chunk_id"] for c in self.chunks if c.get("doc_id") == doc_id]
+        if existing_doc_chunks:
+            stale_chunk_ids = list(set(stale_chunk_ids) | set(existing_doc_chunks))
 
         new_chunks = chunker.chunk_document(doc_id, text, title, metadata=metadata)
         if not new_chunks:
-            return {"status": "skipped", "reason": "no_text_chunks", "doc_id": doc_id}
+            return {
+                "status": "skipped",
+                "reason": "no_text_chunks",
+                "doc_id": doc_id,
+                "version": version,
+                "chunks_indexed": 0
+            }
 
         lock = getattr(self, '_write_lock', None)
         if lock is None:
@@ -2522,6 +2545,34 @@ class VectorIndexer:
                 "index_generation": self.index_generation,
                 "tx_id": staged.tx_id
             }
+
+    def ingest_document(
+        self,
+        doc_id: str,
+        text: str,
+        title: str,
+        chunker: 'TextChunker',
+        version_registry: Optional['DocumentVersionRegistry'] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        persist_snapshot: Optional[bool] = None,
+        snapshot_dir: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Canonical document lifecycle ingestion entrypoint.
+        Routes through the 5-step transactional stage-and-commit lifecycle workflow.
+        Guarantees idempotency, content deduplication, automatic eviction of stale revisions,
+        and ensures chunk ID uniqueness across the active index.
+        """
+        return self.stage_and_commit_document(
+            doc_id=doc_id,
+            text=text,
+            title=title,
+            chunker=chunker,
+            version_registry=version_registry,
+            metadata=metadata,
+            persist_snapshot=persist_snapshot,
+            snapshot_dir=snapshot_dir
+        )
 
     # =========================================================================
     # DOCUMENT LIFECYCLE MANAGEMENT (Deletion, Replacement, Restoration, Cleanup)

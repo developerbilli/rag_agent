@@ -4796,5 +4796,170 @@ class TestFolderIngestionSecurityAndPathValidation(unittest.TestCase):
         self.assertIn("does not exist", res.json().get("detail", ""))
 
 
+class TestCanonicalLifecycleIngestionIntegrity(unittest.TestCase):
+    """
+    Regression test suite verifying that all document ingestion routes
+    (/upload, /ingest, /ingest-folder) route through the canonical document
+    lifecycle API (stage_and_commit_document):
+    1. Uploading the same document twice with identical content skips duplicates,
+       maintaining exactly one revision with strictly unique chunk IDs.
+    2. Uploading the same document twice with modified content replaces the previous
+       revision, evicting stale chunks and bumping the revision version.
+    3. JSON ingestion (/ingest) with the same document ID replaces the previous revision.
+    4. Hybrid fusion ranking combining BM25 and vector search operates on unique chunk IDs
+       without ranking collisions or key errors.
+    5. Source document catalog (GET /documents and GET /documents/{id}) correctly reflects
+       lifecycle state, revision versions, and active status for uploaded files.
+    """
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        from main import app, indexer, chunker
+        self.app = app
+        self.indexer = indexer
+        self.chunker = chunker
+        self.client = TestClient(app)
+        self.admin_headers = {"Authorization": "Bearer admin-token"}
+
+        # Clear index to ensure clean state
+        self.client.post("/clear-index", headers=self.admin_headers)
+
+    def test_lifecycle_01_upload_same_document_twice_retains_single_revision_and_unique_chunks(self):
+        """Uploading the exact same file twice retains 1 revision with unique chunk IDs."""
+        content = b"Enterprise distributed database architecture with multi-region replication."
+        file_payload = [("files", ("distributed_db.txt", content, "text/plain"))]
+
+        # First upload
+        res1 = self.client.post("/upload", files=file_payload, headers=self.admin_headers)
+        self.assertEqual(res1.status_code, 200)
+        data1 = res1.json()
+        self.assertEqual(data1["status"], "success")
+        self.assertEqual(data1["files_processed"], 1)
+        self.assertGreater(data1["chunks_created"], 0)
+        initial_chunk_count = len(self.indexer.chunks)
+
+        # Inspect chunks in active index
+        doc_chunks1 = [c for c in self.indexer.chunks if c.get("doc_id") == "distributed_db"]
+        chunk_ids1 = [c["chunk_id"] for c in doc_chunks1]
+        self.assertEqual(len(chunk_ids1), len(set(chunk_ids1)), "Chunk IDs must be unique after initial upload")
+
+        # Inspect document status in catalog
+        doc_status1 = self.client.get("/documents/distributed_db", headers=self.admin_headers)
+        self.assertEqual(doc_status1.status_code, 200)
+        self.assertEqual(doc_status1.json()["version"], 1)
+        self.assertEqual(doc_status1.json()["status"], "active")
+
+        # Second upload with identical content
+        file_payload_dup = [("files", ("distributed_db.txt", content, "text/plain"))]
+        res2 = self.client.post("/upload", files=file_payload_dup, headers=self.admin_headers)
+        self.assertEqual(res2.status_code, 200)
+        data2 = res2.json()
+        self.assertEqual(data2["status"], "success")
+        self.assertEqual(data2["files_processed"], 1)
+        self.assertEqual(data2["chunks_created"], 0, "No new chunks should be created for identical re-upload")
+
+        # Verify active index contains ONLY 1 current revision and NO duplicate chunk IDs
+        doc_chunks2 = [c for c in self.indexer.chunks if c.get("doc_id") == "distributed_db"]
+        chunk_ids2 = [c["chunk_id"] for c in doc_chunks2]
+        self.assertEqual(len(chunk_ids2), initial_chunk_count, "Chunk count must not double on re-upload")
+        self.assertEqual(len(chunk_ids2), len(set(chunk_ids2)), "All chunk IDs must remain strictly unique")
+
+        all_chunk_ids = [c["chunk_id"] for c in self.indexer.chunks]
+        self.assertEqual(len(all_chunk_ids), len(set(all_chunk_ids)), "Global chunk IDs in active index must be unique")
+
+    def test_lifecycle_02_upload_same_document_with_updated_revision_replaces_old_chunks(self):
+        """Uploading the same file with revised text replaces previous chunks and bumps version."""
+        content_v1 = b"Protocol revision 1: Initial cryptographic handshake and consensus parameters."
+        file_payload_v1 = [("files", ("protocol_spec.md", content_v1, "text/markdown"))]
+
+        res1 = self.client.post("/upload", files=file_payload_v1, headers=self.admin_headers)
+        self.assertEqual(res1.status_code, 200)
+        doc_status1 = self.client.get("/documents/protocol_spec", headers=self.admin_headers).json()
+        self.assertEqual(doc_status1["version"], 1)
+
+        # Upload revised content
+        content_v2 = (
+            b"Protocol revision 2: Enhanced quantum-resistant handshake using Kyber-768 lattice cryptography "
+            b"with post-quantum forward secrecy and authenticated ephemeral key exchange."
+        )
+        file_payload_v2 = [("files", ("protocol_spec.md", content_v2, "text/markdown"))]
+
+        res2 = self.client.post("/upload", files=file_payload_v2, headers=self.admin_headers)
+        self.assertEqual(res2.status_code, 200)
+        data2 = res2.json()
+        self.assertEqual(data2["results"][0]["status"], "committed")
+        self.assertEqual(data2["results"][0]["version"], 2)
+
+        # Verify document status updated to version 2
+        doc_status2 = self.client.get("/documents/protocol_spec", headers=self.admin_headers).json()
+        self.assertEqual(doc_status2["version"], 2)
+        self.assertEqual(doc_status2["status"], "active")
+
+        # Verify all chunks in active index belong to revision 2, and chunk IDs are strictly unique
+        doc_chunks = [c for c in self.indexer.chunks if c.get("doc_id") == "protocol_spec"]
+        chunk_ids = [c["chunk_id"] for c in doc_chunks]
+        self.assertEqual(len(chunk_ids), len(set(chunk_ids)), "Chunk IDs must be unique after revision update")
+
+        # Confirm new content is indexed and old content is not ghosted
+        combined_text = " ".join(c["text"] for c in doc_chunks)
+        self.assertIn("Kyber-768", combined_text)
+        self.assertNotIn("Initial cryptographic handshake", combined_text)
+
+    def test_lifecycle_03_ingest_endpoint_same_doc_id_replaces_previous_revision(self):
+        """JSON /ingest endpoint replaces previous revision and maintains unique chunk IDs."""
+        req1 = {
+            "documents": [
+                {
+                    "doc_id": "service_sla",
+                    "title": "Service Level Agreement",
+                    "text": "Baseline uptime commitment: 99.9% availability."
+                }
+            ]
+        }
+        r1 = self.client.post("/ingest", json=req1, headers=self.admin_headers)
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(self.client.get("/documents/service_sla", headers=self.admin_headers).json()["version"], 1)
+
+        # Re-ingest with updated text
+        req2 = {
+            "documents": [
+                {
+                    "doc_id": "service_sla",
+                    "title": "Service Level Agreement",
+                    "text": "Upgraded enterprise uptime commitment: 99.999% availability with automated multi-zone failover."
+                }
+            ]
+        }
+        r2 = self.client.post("/ingest", json=req2, headers=self.admin_headers)
+        self.assertEqual(r2.status_code, 200)
+
+        # Check version and chunk uniqueness
+        doc_status = self.client.get("/documents/service_sla", headers=self.admin_headers).json()
+        self.assertEqual(doc_status["version"], 2)
+
+        chunks = [c for c in self.indexer.chunks if c.get("doc_id") == "service_sla"]
+        chunk_ids = [c["chunk_id"] for c in chunks]
+        self.assertEqual(len(chunk_ids), len(set(chunk_ids)))
+        self.assertIn("99.999%", chunks[0]["text"])
+
+    def test_lifecycle_04_hybrid_fusion_rankings_with_unique_chunk_ids(self):
+        """Hybrid fusion search operates without ranking collisions after document revision."""
+        # Ingest two documents
+        doc1 = b"Distributed Raft consensus algorithm for distributed state machine replication."
+        doc2 = b"Paxos protocol guarantees consensus across asynchronous networked environments."
+        self.client.post("/upload", files=[("files", ("doc_raft.txt", doc1, "text/plain"))], headers=self.admin_headers)
+        self.client.post("/upload", files=[("files", ("doc_paxos.txt", doc2, "text/plain"))], headers=self.admin_headers)
+
+        # Re-upload doc_raft with updated text
+        doc1_v2 = b"Distributed Raft consensus algorithm with leader election and log compaction mechanisms."
+        self.client.post("/upload", files=[("files", ("doc_raft.txt", doc1_v2, "text/plain"))], headers=self.admin_headers)
+
+        # Execute hybrid search
+        results = self.indexer.search_hybrid("Raft consensus leader election", top_k=5)
+        self.assertGreater(len(results), 0)
+        result_chunk_ids = [r["chunk_id"] for r in results]
+        self.assertEqual(len(result_chunk_ids), len(set(result_chunk_ids)), "Hybrid search results must contain unique chunk IDs")
+
+
 if __name__ == "__main__":
     unittest.main()
