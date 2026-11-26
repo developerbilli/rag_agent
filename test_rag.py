@@ -6319,5 +6319,178 @@ class TestIngestionRBACAndDocumentOwnership(unittest.TestCase):
         self.assertIn("result", last_event)
 
 
+class TestSessionIsolationInRoutingEndpoints(unittest.TestCase):
+    """
+    Test suite verifying strict principal-scoped session isolation in /route-query and /retrieve.
+    Prevents cross-user conversation history leaks during query routing.
+    """
+
+    def setUp(self):
+        self._orig_env = {
+            "RAG_ALLOW_BUILTIN_TOKENS": os.environ.get("RAG_ALLOW_BUILTIN_TOKENS"),
+            "RAG_API_KEY": os.environ.get("RAG_API_KEY"),
+            "RAG_AUTH_MODE": os.environ.get("RAG_AUTH_MODE"),
+        }
+        os.environ["RAG_ALLOW_BUILTIN_TOKENS"] = "true"
+        os.environ.pop("RAG_API_KEY", None)
+        os.environ["RAG_AUTH_MODE"] = "development"
+
+        from main import app, conversation_manager, query_router, principal_registry
+        from rag_core import AuthenticatedPrincipal
+        from fastapi.testclient import TestClient
+
+        self.app = app
+        self.client = TestClient(app)
+        self.cm = conversation_manager
+        self.query_router = query_router
+        self.registry = principal_registry
+
+        # Register Principal A (Alice) and Principal B (Bob)
+        self.token_a = "token-session-alice-isolated"
+        self.token_b = "token-session-bob-isolated"
+
+        self.principal_a = AuthenticatedPrincipal(
+            principal_id="alice_user_isolated",
+            roles=["user"],
+            clearance_level="public"
+        )
+        self.principal_b = AuthenticatedPrincipal(
+            principal_id="bob_user_isolated",
+            roles=["user"],
+            clearance_level="public"
+        )
+
+        self.registry.register(self.token_a, self.principal_a)
+        self.registry.register(self.token_b, self.principal_b)
+
+        self.headers_a = {"Authorization": f"Bearer {self.token_a}"}
+        self.headers_b = {"Authorization": f"Bearer {self.token_b}"}
+
+    def tearDown(self):
+        for k, v in self._orig_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_principal_b_cannot_access_or_use_principal_a_history_in_route_query(self):
+        """
+        Two-principal regression test for /route-query:
+        - Principal A creates a conversation in session 'project_qna'.
+        - Principal B requests routing using Principal A's session ID 'project_qna'.
+        - Principal B must not receive, use, or affect Principal A's history.
+        """
+        from unittest.mock import patch
+
+        session_id = "project_qna"
+        scoped_a = self.cm.scoped_session_id(self.principal_a.principal_id, session_id)
+        scoped_b = self.cm.scoped_session_id(self.principal_b.principal_id, session_id)
+
+        # 1. Principal A creates conversation history
+        self.cm.add_turn(
+            scoped_a,
+            "Explain Reciprocal Rank Fusion in detail.",
+            "RRF is an algorithm that combines rankings from dense and sparse retrievers."
+        )
+        history_a = self.cm.get_history(scoped_a)
+        self.assertEqual(len(history_a), 1)
+
+        # Ensure Bob's scoped session starts empty
+        self.assertEqual(len(self.cm.get_history(scoped_b)), 0)
+
+        # 2. Spy on query_router.route_query to inspect the exact history parameter passed
+        with patch.object(self.query_router, "route_query", wraps=self.query_router.route_query) as spy_route:
+            # Principal A routes a follow-up query with use_memory=True
+            res_a = self.client.post(
+                "/route-query",
+                json={"query": "How does it work?", "session_id": session_id, "use_memory": True},
+                headers=self.headers_a
+            )
+            self.assertEqual(res_a.status_code, 200)
+
+            # Principal A's routing received Alice's history
+            history_arg_a = spy_route.call_args[1].get("history")
+            self.assertIsNotNone(history_arg_a)
+            self.assertEqual(len(history_arg_a), 1)
+            self.assertEqual(history_arg_a[0]["user"], "Explain Reciprocal Rank Fusion in detail.")
+
+            spy_route.reset_mock()
+
+            # 3. Principal B requests routing using Principal A's session ID
+            res_b = self.client.post(
+                "/route-query",
+                json={"query": "How does it work?", "session_id": session_id, "use_memory": True},
+                headers=self.headers_b
+            )
+            self.assertEqual(res_b.status_code, 200)
+
+            # Principal B's routing must receive Bob's scoped history (empty list / None), NOT Alice's history
+            history_arg_b = spy_route.call_args[1].get("history")
+            self.assertTrue(history_arg_b is None or len(history_arg_b) == 0)
+
+            # Because Bob has no history for "How does it work?", it classifies as CLARIFICATION
+            self.assertEqual(res_b.json()["routing_decision"]["route"], "clarification")
+
+    def test_principal_b_cannot_access_or_use_principal_a_history_in_retrieve_auto_route(self):
+        """
+        Two-principal regression test for /retrieve with auto_route=True:
+        - Principal A creates a conversation in session 'data_investigation'.
+        - Principal B requests auto-routed retrieval using session 'data_investigation'.
+        - Principal B must not receive or use Principal A's history.
+        """
+        from unittest.mock import patch
+
+        session_id = "data_investigation"
+        scoped_a = self.cm.scoped_session_id(self.principal_a.principal_id, session_id)
+        scoped_b = self.cm.scoped_session_id(self.principal_b.principal_id, session_id)
+
+        # 1. Principal A creates conversation history
+        self.cm.add_turn(
+            scoped_a,
+            "Tell me about vector embeddings and BM25.",
+            "BM25 handles exact keyword matches while dense handles semantic vectors."
+        )
+
+        with patch.object(self.query_router, "route_query", wraps=self.query_router.route_query) as spy_route:
+            # Principal B calls /retrieve with auto_route=True and session_id='data_investigation'
+            res_b = self.client.post(
+                "/retrieve",
+                json={"query": "Which one is better?", "session_id": session_id, "use_memory": True, "auto_route": True},
+                headers=self.headers_b
+            )
+            self.assertEqual(res_b.status_code, 200)
+
+            # Verify history passed to query_router for Bob does not contain Alice's history
+            history_arg_b = spy_route.call_args[1].get("history")
+            self.assertTrue(history_arg_b is None or len(history_arg_b) == 0)
+
+            # Bob's query route used should be clarification because Bob has no prior conversation context
+            self.assertEqual(res_b.json().get("route_used"), "clarification")
+
+    def test_principal_b_spoofed_scoped_session_id_cannot_access_a_history(self):
+        """
+        Attempting to directly pass Principal A's scoped session string still scopes to Principal B.
+        """
+        from unittest.mock import patch
+
+        session_id = "private_session"
+        scoped_a = self.cm.scoped_session_id(self.principal_a.principal_id, session_id)
+
+        self.cm.add_turn(scoped_a, "Top secret query", "Top secret answer")
+
+        with patch.object(self.query_router, "route_query", wraps=self.query_router.route_query) as spy_route:
+            # Bob maliciously supplies Alice's scoped session ID directly
+            res_b = self.client.post(
+                "/route-query",
+                json={"query": "How does it work?", "session_id": scoped_a, "use_memory": True},
+                headers=self.headers_b
+            )
+            self.assertEqual(res_b.status_code, 200)
+
+            history_arg_b = spy_route.call_args[1].get("history")
+            self.assertTrue(history_arg_b is None or len(history_arg_b) == 0)
+            self.assertEqual(res_b.json()["routing_decision"]["route"], "clarification")
+
+
 if __name__ == "__main__":
     unittest.main()

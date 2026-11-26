@@ -413,5 +413,20 @@ Allowing ordinary authenticated users to ingest or overwrite documents exposes t
 
 ---
 
+## Production Security: Multi-Principal Session Scoping & Conversation Isolation
+
+Allowing multi-turn conversation memory without cryptographic or principal-scoped boundaries enables cross-user history leakage. A caller could request another user's session identifier to inspect conversation turns or alter query routing classifications.
+
+### Implementation Safeguards (`main.py` & `rag_core.py`):
+1. **Cryptographic Principal Session Scoping (`resolve_scoped_session`)**:
+   - Client-requested session identifiers are mapped to internal principal-scoped IDs: `<principal_id>:<client_session_id>`.
+   - Prevents collision or cross-principal memory leakage even if different callers specify generic session IDs like `"default"` or `"chat"`.
+2. **Complete Coverage Across All Endpoints**:
+   - **Generation Endpoints**: `/generate-rag` and `/generate-guarded` scope both conversation history retrieval and turn addition.
+   - **Query Routing Endpoints**: `/route-query` and `/retrieve` (with `auto_route=True`) resolve the scoped session ID prior to retrieving memory for routing decisions.
+   - **Session Management**: `/sessions` and `/sessions/{session_id}` enforce ownership; ordinary users can only view or clear their own scoped conversation history, while administrators retain system-wide visibility.
+
+---
+
 ## Conclusion
 Our project architecture provides concrete, production-grade implementations for each of these 10 areas, balancing lightweight local edge constraints (running smoothly on Apple Silicon with 16 GB RAM) with enterprise-level robustness.

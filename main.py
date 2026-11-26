@@ -1573,7 +1573,8 @@ def route_query_endpoint(
     t0 = time.perf_counter()
     trusted_user_context = build_authoritative_user_context(principal, req.user_context)
     known_docs = list(set(c.get("doc_id", "") for c in indexer.chunks))
-    history = conversation_manager.get_history(req.session_id or "default") if req.use_memory else None
+    _, scoped_session_id = resolve_scoped_session(principal, req.session_id)
+    history = conversation_manager.get_history(scoped_session_id) if req.use_memory else None
     decision = query_router.route_query(
         query=req.query,
         history=history,
@@ -1603,7 +1604,8 @@ def retrieve_context(
     trusted_user_context = build_authoritative_user_context(principal, req.user_context)
     if req.auto_route:
         known_docs = list(set(c.get("doc_id", "") for c in indexer.chunks))
-        history = conversation_manager.get_history(req.session_id or "default") if req.use_memory else None
+        _, scoped_session_id = resolve_scoped_session(principal, req.session_id)
+        history = conversation_manager.get_history(scoped_session_id) if req.use_memory else None
         decision = query_router.route_query(
             query=req.query,
             history=history,
