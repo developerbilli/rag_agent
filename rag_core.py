@@ -1965,7 +1965,17 @@ class VectorIndexer:
                 print(f"[VectorIndexer] Query vector dimension ({query_vec.shape[0]}) does not match index dimension ({candidate_embeddings.shape[1]}). Re-encoding index...", flush=True)
                 self.rebuild_index()
                 snap = self.get_snapshot()
-                candidate_embeddings = snap.embeddings[valid_indices] if valid_indices is not None else snap.embeddings
+                if has_filtering:
+                    valid_indices = [
+                        i for i, c in enumerate(snap.chunks)
+                        if c.get("doc_id") not in deleted_docs and MetadataFilterEngine.matches(c, filters, user_context)
+                    ]
+                    if not valid_indices:
+                        return []
+                    candidate_embeddings = snap.embeddings[valid_indices]
+                else:
+                    valid_indices = None
+                    candidate_embeddings = snap.embeddings
                 res2 = self._encode([query])
                 query_vec = (res2[0] if isinstance(res2, tuple) else res2)[0]
 
@@ -1979,6 +1989,14 @@ class VectorIndexer:
             item = dict(snap.chunks[orig_idx])
             item["score"] = float(scores[sub_idx])
             results.append(item)
+
+        # Freshness check: filter out any documents marked deleted during in-flight retrieval
+        latest_deleted = {
+            k for k, v in getattr(self, 'source_documents', {}).items()
+            if v.get("status") == "deleted" or bool(v.get("deleted"))
+        }
+        if latest_deleted:
+            results = [r for r in results if r.get("doc_id") not in latest_deleted]
 
         # 3. Cache result with active generation validation
         if hasattr(self, 'retrieval_cache') and self.retrieval_cache is not None:
@@ -2138,6 +2156,13 @@ class VectorIndexer:
                 item["modality"] = "reranker"
         else:
             final_res = candidates[:top_k]
+
+        latest_deleted = {
+            k for k, v in getattr(self, 'source_documents', {}).items()
+            if v.get("status") == "deleted" or bool(v.get("deleted"))
+        }
+        if latest_deleted:
+            final_res = [r for r in final_res if r.get("doc_id") not in latest_deleted]
 
         if hasattr(self, 'retrieval_cache') and self.retrieval_cache is not None:
             self.retrieval_cache.set(cache_key, top_k, filters, user_context, gen, final_res, current_generation=self.get_current_generation())
@@ -2533,6 +2558,34 @@ class VectorIndexer:
         snapshot_dir: Optional[str] = None
     ) -> Dict[str, Any]:
         """
+        Canonical staged index construction & atomic publication ingestion pipeline.
+        Acquires per-document mutex lock (DocumentLockManager.process_lock) to prevent
+        concurrency races, TOCTOU interleaving, and duplicate ingestion.
+        """
+        with DocumentLockManager.get_instance().process_lock(doc_id):
+            return self._stage_and_commit_document_impl(
+                doc_id=doc_id,
+                text=text,
+                title=title,
+                chunker=chunker,
+                version_registry=version_registry,
+                metadata=metadata,
+                persist_snapshot=persist_snapshot,
+                snapshot_dir=snapshot_dir
+            )
+
+    def _stage_and_commit_document_impl(
+        self,
+        doc_id: str,
+        text: str,
+        title: str,
+        chunker: 'TextChunker',
+        version_registry: Optional['DocumentVersionRegistry'] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        persist_snapshot: Optional[bool] = None,
+        snapshot_dir: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
         Staged Index Construction & Atomic Publication Ingestion Pipeline:
         1. Prepare: Check idempotency and chunk document.
         2. Stage: Build candidate replacement state in complete isolation.
@@ -2688,6 +2741,26 @@ class VectorIndexer:
         """
         Removes a document and all its chunks using staged index construction.
         Atomically updates Dense, BM25, Registry, Source Docs, and Cache without dirty reads.
+        Protected by per-document process lock.
+        """
+        with DocumentLockManager.get_instance().process_lock(doc_id):
+            return self._delete_document_impl(
+                doc_id=doc_id,
+                hard_delete=hard_delete,
+                persist_snapshot=persist_snapshot,
+                snapshot_dir=snapshot_dir
+            )
+
+    def _delete_document_impl(
+        self,
+        doc_id: str,
+        hard_delete: bool = False,
+        persist_snapshot: Optional[bool] = None,
+        snapshot_dir: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Removes a document and all its chunks using staged index construction.
+        Atomically updates Dense, BM25, Registry, Source Docs, and Cache without dirty reads.
         """
         doc_chunks = [c for c in self.chunks if c.get("doc_id") == doc_id]
         has_source = hasattr(self, 'source_documents') and doc_id in self.source_documents
@@ -2751,6 +2824,32 @@ class VectorIndexer:
             }
 
     def replace_document(
+        self,
+        doc_id: str,
+        text: str,
+        title: str,
+        chunker: 'TextChunker',
+        metadata: Optional[Dict[str, Any]] = None,
+        persist_snapshot: Optional[bool] = None,
+        snapshot_dir: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Atomically replaces a document with new content using staged index construction.
+        Builds, validates, optionally persists, and atomically publishes the replacement state.
+        Protected by per-document process lock.
+        """
+        with DocumentLockManager.get_instance().process_lock(doc_id):
+            return self._replace_document_impl(
+                doc_id=doc_id,
+                text=text,
+                title=title,
+                chunker=chunker,
+                metadata=metadata,
+                persist_snapshot=persist_snapshot,
+                snapshot_dir=snapshot_dir
+            )
+
+    def _replace_document_impl(
         self,
         doc_id: str,
         text: str,
@@ -2845,7 +2944,12 @@ class VectorIndexer:
         """
         Restores a soft-deleted document from source document tracking,
         re-indexing its chunks into Dense and BM25 indices.
+        Protected by per-document process lock.
         """
+        with DocumentLockManager.get_instance().process_lock(doc_id):
+            return self._restore_document_impl(doc_id=doc_id, chunker=chunker)
+
+    def _restore_document_impl(self, doc_id: str, chunker: 'TextChunker') -> Dict[str, Any]:
         source_doc = getattr(self, 'source_documents', {}).get(doc_id)
         if not source_doc or not source_doc.get("text"):
             raise ValueError(f"Cannot restore document '{doc_id}': No source document text found.")
@@ -4187,16 +4291,18 @@ class DocumentVersionRegistry:
 class DocumentLockManager:
     """
     Manages per-document mutex locks to prevent race conditions and duplicate ingestion.
-    Supports both intra-process thread synchronization (threading.Lock) and
+    Supports both intra-process thread synchronization (threading.RLock) and
     cross-process multi-worker synchronization via OS file locks (fcntl.flock).
+    Fully re-entrant across nested execution layers on the same thread.
     """
     _instance = None
     _global_lock = threading.Lock()
 
     def __init__(self, lock_dir: str = ".locks"):
-        self._doc_locks: Dict[str, threading.Lock] = {}
+        self._doc_locks: Dict[str, threading.RLock] = {}
         self.lock_dir = lock_dir
         os.makedirs(self.lock_dir, exist_ok=True)
+        self._local = threading.local()
 
     @classmethod
     def get_instance(cls):
@@ -4205,42 +4311,60 @@ class DocumentLockManager:
                 cls._instance = cls()
             return cls._instance
 
-    def get_lock(self, doc_id: str) -> threading.Lock:
+    def get_lock(self, doc_id: str) -> threading.RLock:
         with self._global_lock:
             if doc_id not in self._doc_locks:
-                self._doc_locks[doc_id] = threading.Lock()
+                self._doc_locks[doc_id] = threading.RLock()
             return self._doc_locks[doc_id]
 
     @contextlib.contextmanager
     def process_lock(self, doc_id: str, timeout: float = 30.0):
         """
-        Acquires both an in-memory thread lock and an OS-level file lock (fcntl.flock)
+        Acquires both an in-memory thread lock (RLock) and an OS-level file lock (fcntl.flock)
         to coordinate across multiple worker processes (e.g. gunicorn / uvicorn multi-worker).
+        Re-entrant safe: nested calls on the same thread acquire the RLock and increment depth,
+        while OS flock is acquired only on the outermost level.
         """
-        thread_lock = self.get_lock(doc_id)
-        acquired = thread_lock.acquire(timeout=timeout)
+        rlock = self.get_lock(doc_id)
+        acquired = rlock.acquire(timeout=timeout)
         if not acquired:
             raise TimeoutError(f"Could not acquire thread lock for doc_id '{doc_id}' within {timeout}s")
 
-        lock_path = os.path.join(self.lock_dir, f"{re.sub(r'[^a-zA-Z0-9_-]', '_', doc_id)}.lock")
+        held_depth = getattr(self._local, "held_depth", None)
+        if held_depth is None:
+            held_depth = {}
+            self._local.held_depth = held_depth
+
+        current_depth = held_depth.get(doc_id, 0)
+        is_reentrant = current_depth > 0
+        held_depth[doc_id] = current_depth + 1
         file_obj = None
+
         try:
-            try:
-                import fcntl
-                file_obj = open(lock_path, "w")
-                fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX)
-            except (ImportError, AttributeError, OSError):
-                pass
-            yield
-        finally:
-            if file_obj is not None:
+            if not is_reentrant:
+                safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', doc_id)[:200]
+                lock_path = os.path.join(self.lock_dir, f"{safe_name}.lock")
                 try:
                     import fcntl
-                    fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
-                    file_obj.close()
-                except Exception:
+                    file_obj = open(lock_path, "w")
+                    fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX)
+                except (ImportError, AttributeError, OSError):
                     pass
-            thread_lock.release()
+            yield
+        finally:
+            try:
+                held_depth[doc_id] -= 1
+                if held_depth[doc_id] <= 0:
+                    held_depth.pop(doc_id, None)
+                    if file_obj is not None:
+                        try:
+                            import fcntl
+                            fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
+                            file_obj.close()
+                        except Exception:
+                            pass
+            finally:
+                rlock.release()
 
 
 @dataclass

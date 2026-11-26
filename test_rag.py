@@ -6436,6 +6436,86 @@ class TestIngestionRBACAndDocumentOwnership(unittest.TestCase):
         user_principal = AuthenticatedPrincipal(principal_id="standard_user", roles=["user"])
         self.assertIsNone(self.indexer.get_document_status(doc_id, user_context=user_principal))
 
+    def test_concurrent_upload_same_doc_id_prevents_toctou_overwrite(self):
+        """Concurrent uploads of the same doc_id by different users serialize cleanly without TOCTOU overwrite."""
+        import concurrent.futures
+        doc_name = f"concurrent_budget_{int(self.time.time() * 1000)}.txt"
+        stem = os.path.splitext(doc_name)[0]
+
+        # Register Bob
+        from main import principal_registry
+        from rag_core import AuthenticatedPrincipal
+        principal_registry.register(
+            "user-token-bob-toctou",
+            AuthenticatedPrincipal(principal_id="bob_toctou", roles=["user"], clearance_level="public")
+        )
+        bob_headers = {"Authorization": "Bearer user-token-bob-toctou"}
+
+        def upload_alice():
+            return self.client.post(
+                "/upload",
+                files=[("files", (doc_name, b"Alice official Q4 budget payload.", "text/plain"))],
+                headers=self.user_headers
+            )
+
+        def upload_bob():
+            return self.client.post(
+                "/upload",
+                files=[("files", (doc_name, b"Bob unauthorized Q4 budget hijack.", "text/plain"))],
+                headers=bob_headers
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            f1 = executor.submit(upload_alice)
+            f2 = executor.submit(upload_bob)
+            r1 = f1.result()
+            r2 = f2.result()
+
+        statuses = sorted([r1.status_code, r2.status_code])
+        # One must succeed (200) and the other must be rejected for foreign overwrite (403)
+        self.assertEqual(statuses, [200, 403])
+
+        # Ensure the winner's text was preserved and not overwritten
+        doc = self.indexer.get_document_status(stem)
+        self.assertIsNotNone(doc)
+        winner_owner = doc.get("owner_id")
+        self.assertIn(winner_owner, ["standard_user", "bob_toctou"])
+        if winner_owner == "standard_user":
+            self.assertIn("Alice official Q4 budget payload", doc.get("text", ""))
+        else:
+            self.assertIn("Bob unauthorized Q4 budget hijack", doc.get("text", ""))
+
+    def test_document_lock_reentrancy_and_serialization(self):
+        """Verify DocumentLockManager process_lock is fully re-entrant and serializes concurrent threads."""
+        import threading
+        import time
+        from rag_core import DocumentLockManager
+        lock_mgr = DocumentLockManager.get_instance()
+        doc_id = f"test_reentrant_doc_{int(self.time.time() * 1000)}"
+
+        # Nested reentrant acquisition on same thread succeeds without deadlock or timeout
+        with lock_mgr.process_lock(doc_id, timeout=1.0):
+            with lock_mgr.process_lock(doc_id, timeout=1.0):
+                with lock_mgr.process_lock(doc_id, timeout=1.0):
+                    pass
+
+        # Concurrent acquisition from another thread serializes
+        events = []
+        def background_holder():
+            with lock_mgr.process_lock(doc_id, timeout=2.0):
+                events.append("bg_started")
+                time.sleep(0.05)
+                events.append("bg_done")
+
+        t = threading.Thread(target=background_holder)
+        t.start()
+        time.sleep(0.01)  # ensure bg thread starts and acquires lock
+        with lock_mgr.process_lock(doc_id, timeout=2.0):
+            events.append("main_acquired")
+        t.join()
+
+        self.assertEqual(events, ["bg_started", "bg_done", "main_acquired"])
+
 
 class TestSessionIsolationInRoutingEndpoints(unittest.TestCase):
     """

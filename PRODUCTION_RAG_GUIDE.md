@@ -493,6 +493,11 @@ When enforcing document-level RBAC/ABAC access control (`MetadataFilterEngine.ev
 ### 6. Strict Retrieval Mode Validation
 - Unknown or unsupported `retrieval_mode` values are rejected immediately with HTTP `400 Bad Request` rather than silently falling back to hybrid retrieval, preventing misconfigured client applications from receiving unexpected rankings.
 
+### 7. TOCTOU Race Prevention via Re-entrant Document Mutex Locking
+- **The Problem**: In concurrent ingestion paths, performing existence and authorization checks (`indexer.get_raw_document(doc_id)`) outside of a mutex prior to `stage_and_commit_document()` creates a Time-of-Check to Time-of-Use (TOCTOU) race condition. If two requests for the same `doc_id` arrive concurrently from different users, both checks return `None` (create), allowing a secondary request to overwrite or hijack another user's freshly created document.
+- **Re-entrant Process Locking**: `DocumentLockManager.process_lock(doc_id)` coordinates intra-process thread synchronization via `threading.RLock()` and cross-process multi-worker synchronization via OS file locks (`fcntl.flock`). It tracks recursion depth per-thread using `threading.local()`, making it fully re-entrant and composable across architectural layers.
+- **Atomic Critical Section**: In `/upload`, `/ingest`, `/ingest-folder`, and `/documents/{doc_id}`, `process_lock(doc_id)` is acquired *before* reading internal state and held continuously through ownership validation, chunking, and index staging/commit. Competing uploads for the same document ID serialize cleanly: the winning thread creates the document with its owner identity, and subsequent threads immediately detect existing ownership and are rejected with HTTP `403 Forbidden` (`overwrite_rejected`).
+
 ---
 
 ## Conclusion
