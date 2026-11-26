@@ -227,6 +227,7 @@ The pipeline provides configurable authentication modes via `RAG_AUTH_MODE=devel
 - **Ingestion RBAC & Document Ownership**:
   - `POST /ingest` requires administrative or `data_admin` privileges; regular users receive HTTP 403 Forbidden.
   - `POST /upload` tracks document `owner_id`. Regular users cannot overwrite documents owned by others (system or other users), returning HTTP 403 Forbidden on foreign overwrite attempts.
+  - **Soft-Deleted Document Resurrection Prevention**: Ordinary users cannot resurrect or overwrite soft-deleted documents via `/upload` or `/ingest` (returns HTTP 403 Forbidden). Existence checking is decoupled from authorization via `VectorIndexer.get_raw_document()`, ensuring soft-deleted documents require administrator restoration (`/documents/{doc_id}/restore`).
   - Document lifecycle operations record audit trails (`principal_id`, `doc_id`, `operation`, `result`).
 - **Complete Principal Session Isolation**:
   - All conversation memory lookups across generation (`/generate-rag`, `/generate-guarded`), query classification (`/route-query`), and auto-routing (`/retrieve`) strictly enforce internal principal-scoped session IDs (`<principal_id>:<session_id>`), preventing cross-user history exposure or routing poisoning.

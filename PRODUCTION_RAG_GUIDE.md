@@ -408,8 +408,12 @@ Allowing ordinary authenticated users to ingest or overwrite documents exposes t
 3. **Separation of Creation from Replacement**:
    - Document creation (`upload_create`) is permitted for authenticated users.
    - Document replacement (`upload_replace`) requires administrative privileges or explicit document ownership with replacement permission.
-4. **Structured Security Audit Logging**:
-   - All document operations (`create`, `replace`, `overwrite_rejected`, `ingest`) record structured security audit logs in `OperationalObservabilityDashboard.record_document_audit_event()` with `principal_id`, `doc_id`, `operation`, `result`, and contextual metadata.
+4. **Resurrection Prevention for Soft-Deleted Documents**:
+   - `VectorIndexer.get_raw_document(doc_id)` provides authoritative existence and lifecycle checking against internal stores (`source_documents` and `version_registry.registry`) without authorization filtering.
+   - When an ordinary user uploads or ingests a file resolving to an existing soft-deleted document ID, the system detects the deleted state and unconditionally rejects the request with HTTP `403 Forbidden` (`"Access denied: Document '{doc_id}' has been deleted. Restoration or replacement of deleted documents requires administrator authorization."`).
+   - Restoration of soft-deleted documents is strictly restricted to administrators (`POST /documents/{doc_id}/restore`), preventing privilege escalation and document resurrection attacks.
+5. **Structured Security Audit Logging**:
+   - All document operations (`create`, `replace`, `overwrite_rejected`, `resurrection_rejected`, `ingest`) record structured security audit logs in `OperationalObservabilityDashboard.record_document_audit_event()` with `principal_id`, `doc_id`, `operation`, `result`, and contextual metadata.
 
 ---
 

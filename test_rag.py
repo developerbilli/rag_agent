@@ -6318,6 +6318,46 @@ class TestIngestionRBACAndDocumentOwnership(unittest.TestCase):
         self.assertIn("operation", last_event)
         self.assertIn("result", last_event)
 
+    def test_regular_user_cannot_resurrect_deleted_document(self):
+        """Regular user cannot resurrect or overwrite a soft-deleted document via /upload."""
+        from rag_core import AuthenticatedPrincipal
+        doc_name = f"finance_report_{int(self.time.time() * 1000)}.txt"
+        doc_id = os.path.splitext(doc_name)[0]
+
+        # 1. Admin creates and soft-deletes a document
+        res_create = self.client.post(
+            "/upload",
+            files=[("files", (doc_name, b"Q3 Confidential Financial Report.", "text/plain"))],
+            headers=self.admin_headers
+        )
+        self.assertEqual(res_create.status_code, 200)
+
+        res_del = self.client.delete(f"/documents/{doc_id}", headers=self.admin_headers)
+        self.assertEqual(res_del.status_code, 200)
+
+        # Confirm document is soft-deleted in authoritative raw store
+        raw_doc = self.indexer.get_raw_document(doc_id)
+        self.assertIsNotNone(raw_doc)
+        self.assertEqual(raw_doc.get("status"), "deleted")
+
+        # 2. Regular user uploads a file resolving to the same doc_id
+        res_upload = self.client.post(
+            "/upload",
+            files=[("files", (doc_name, b"Malicious attempt to resurrect deleted report.", "text/plain"))],
+            headers=self.user_headers
+        )
+        # Expected: HTTP 403 Forbidden
+        self.assertEqual(res_upload.status_code, 403)
+        self.assertIn("has been deleted", res_upload.json().get("detail", ""))
+
+        # Expected: document remains deleted in raw store
+        raw_doc_after = self.indexer.get_raw_document(doc_id)
+        self.assertEqual(raw_doc_after.get("status"), "deleted")
+
+        # 3. Regular user cannot retrieve it
+        user_principal = AuthenticatedPrincipal(principal_id="standard_user", roles=["user"])
+        self.assertIsNone(self.indexer.get_document_status(doc_id, user_context=user_principal))
+
 
 class TestSessionIsolationInRoutingEndpoints(unittest.TestCase):
     """

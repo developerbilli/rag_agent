@@ -3328,6 +3328,19 @@ class VectorIndexer:
                     f"Model upgrade aborted: {e}. Active index preserved intact with model '{old_model}' ({old_backend})."
                 ) from e
 
+    def get_raw_document(self, doc_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieves the raw authoritative internal document record without authorization filtering.
+        Used strictly for internal lifecycle state checks, existence verification, and ownership validation.
+        """
+        if hasattr(self, 'source_documents') and doc_id in self.source_documents:
+            return dict(self.source_documents[doc_id])
+        if hasattr(self, 'version_registry') and hasattr(self.version_registry, 'registry') and doc_id in self.version_registry.registry:
+            doc = dict(self.version_registry.registry[doc_id])
+            doc.setdefault("doc_id", doc_id)
+            return doc
+        return None
+
     def get_document_status(
         self,
         doc_id: str,

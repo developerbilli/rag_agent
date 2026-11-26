@@ -980,8 +980,33 @@ def ingest_documents(
     total_chunks_created = 0
 
     for doc in req.documents:
-        existing_doc = indexer.get_document_status(doc.doc_id, include_deleted=True)
-        op_type = "replace" if existing_doc else "create"
+        # Authoritative existence and lifecycle check on internal document store
+        raw_existing_doc = indexer.get_raw_document(doc.doc_id)
+        if raw_existing_doc:
+            is_deleted = raw_existing_doc.get("status") == "deleted" or bool(raw_existing_doc.get("deleted"))
+            if is_deleted:
+                if not principal.is_admin():
+                    dashboard.record_document_audit_event(
+                        principal_id=principal.principal_id,
+                        doc_id=doc.doc_id,
+                        operation="resurrection_rejected",
+                        result="FORBIDDEN",
+                        details={"reason": "Non-admin cannot resurrect deleted document via ingest"}
+                    )
+                    logger.warning(
+                        f"[Security Audit] Ingestion resurrection rejected: principal_id='{principal.principal_id}' "
+                        f"attempted to ingest/resurrect soft-deleted document '{doc.doc_id}'."
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=f"Access denied: Document '{doc.doc_id}' has been deleted. "
+                               f"Restoration requires administrator authorization."
+                    )
+                op_type = "replace"
+            else:
+                op_type = "replace"
+        else:
+            op_type = "create"
 
         doc_meta = dict(doc.metadata or {})
         doc_meta.setdefault("owner_id", principal.principal_id)
@@ -1255,52 +1280,80 @@ async def upload_files(
 
                 doc_id = doc["doc_id"]
 
-                # Document Ownership & Replacement Authorization Check
-                existing_doc = indexer.get_document_status(doc_id, include_deleted=True)
-                if existing_doc:
-                    op_type = "replace"
-                    existing_owner = existing_doc.get("owner_id") or existing_doc.get("metadata", {}).get("owner_id") or "system"
+                # Authoritative Existence & Lifecycle Check (directly on internal document store, without authorization filtering)
+                raw_existing_doc = indexer.get_raw_document(doc_id)
+                if raw_existing_doc:
+                    is_deleted = raw_existing_doc.get("status") == "deleted" or bool(raw_existing_doc.get("deleted"))
+                    existing_owner = raw_existing_doc.get("owner_id") or raw_existing_doc.get("metadata", {}).get("owner_id") or "system"
 
-                    # 1. Prohibit overwriting documents owned by others (system, admin, other users)
-                    if not principal.is_admin() and existing_owner != principal.principal_id:
-                        dashboard.record_document_audit_event(
-                            principal_id=principal.principal_id,
-                            doc_id=doc_id,
-                            operation="overwrite_rejected",
-                            result="FORBIDDEN",
-                            details={
-                                "existing_owner": existing_owner,
-                                "filename": filename,
-                                "reason": "Caller does not own existing document"
-                            }
-                        )
-                        logger.warning(
-                            f"[Security Audit] Overwrite rejected: principal_id='{principal.principal_id}' "
-                            f"attempted to overwrite document '{doc_id}' owned by '{existing_owner}'. "
-                            f"Operation: 'upload_overwrite', Result: 'FORBIDDEN'"
-                        )
-                        raise HTTPException(
-                            status_code=status.HTTP_403_FORBIDDEN,
-                            detail=f"Access denied: Document '{doc_id}' already exists and is owned by '{existing_owner}'. "
-                                   f"You do not have permission to overwrite documents you do not own."
-                        )
-
-                    # 2. Separate creation from replacement: verify caller replacement privileges
-                    if not principal.is_admin():
-                        allow_own = os.environ.get("RAG_ALLOW_USER_DOCUMENT_REPLACEMENT", "true").lower() in ("true", "1", "yes")
-                        if not (allow_own or any(r in ("editor", "doc_editor", "data_admin") for r in principal.roles)):
+                    # Rule 1: Existing deleted document -> reject ordinary user upload, resurrection is administrator-only
+                    if is_deleted:
+                        if not principal.is_admin():
+                            dashboard.record_document_audit_event(
+                                principal_id=principal.principal_id,
+                                doc_id=doc_id,
+                                operation="resurrection_rejected",
+                                result="FORBIDDEN",
+                                details={
+                                    "existing_owner": existing_owner,
+                                    "filename": filename,
+                                    "reason": "Regular user cannot resurrect soft-deleted document"
+                                }
+                            )
+                            logger.warning(
+                                f"[Security Audit] Resurrection rejected: principal_id='{principal.principal_id}' "
+                                f"attempted to upload/resurrect soft-deleted document '{doc_id}'. "
+                                f"Operation: 'upload_resurrection', Result: 'FORBIDDEN'"
+                            )
+                            raise HTTPException(
+                                status_code=status.HTTP_403_FORBIDDEN,
+                                detail=f"Access denied: Document '{doc_id}' has been deleted. "
+                                       f"Restoration or replacement of deleted documents requires administrator authorization."
+                            )
+                        op_type = "replace"
+                    else:
+                        # Rule 2: Existing active document -> enforce ownership and replacement permission
+                        op_type = "replace"
+                        if not principal.is_admin() and existing_owner != principal.principal_id:
                             dashboard.record_document_audit_event(
                                 principal_id=principal.principal_id,
                                 doc_id=doc_id,
                                 operation="overwrite_rejected",
                                 result="FORBIDDEN",
-                                details={"reason": "User lacks document replacement permission"}
+                                details={
+                                    "existing_owner": existing_owner,
+                                    "filename": filename,
+                                    "reason": "Caller does not own existing document"
+                                }
+                            )
+                            logger.warning(
+                                f"[Security Audit] Overwrite rejected: principal_id='{principal.principal_id}' "
+                                f"attempted to overwrite document '{doc_id}' owned by '{existing_owner}'. "
+                                f"Operation: 'upload_overwrite', Result: 'FORBIDDEN'"
                             )
                             raise HTTPException(
                                 status_code=status.HTTP_403_FORBIDDEN,
-                                detail=f"Access denied: Principal '{principal.principal_id}' lacks document replacement permission."
+                                detail=f"Access denied: Document '{doc_id}' already exists and is owned by '{existing_owner}'. "
+                                       f"You do not have permission to overwrite documents you do not own."
                             )
+
+                        # Verify caller replacement privileges
+                        if not principal.is_admin():
+                            allow_own = os.environ.get("RAG_ALLOW_USER_DOCUMENT_REPLACEMENT", "true").lower() in ("true", "1", "yes")
+                            if not (allow_own or any(r in ("editor", "doc_editor", "data_admin") for r in principal.roles)):
+                                dashboard.record_document_audit_event(
+                                    principal_id=principal.principal_id,
+                                    doc_id=doc_id,
+                                    operation="overwrite_rejected",
+                                    result="FORBIDDEN",
+                                    details={"reason": "User lacks document replacement permission"}
+                                )
+                                raise HTTPException(
+                                    status_code=status.HTTP_403_FORBIDDEN,
+                                    detail=f"Access denied: Principal '{principal.principal_id}' lacks document replacement permission."
+                                )
                 else:
+                    # Rule 3: Brand-new document -> assign ownership from authenticated principal
                     op_type = "create"
 
                 doc_meta = dict(doc.get("metadata", {}))
